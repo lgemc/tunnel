@@ -1,0 +1,44 @@
+# Build artifacts
+build/
+dist/
+
+# Lambda binaries
+lambdas/**/bootstrap
+lambdas/**/*.zip
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/*.tfvars
+infra/.terraform.tfstate.lock.info
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+.env
+.env.local
+config.yaml
+
+# Logs
+*.log
