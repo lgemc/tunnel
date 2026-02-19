@@ -243,24 +243,21 @@ resource "aws_lambda_permission" "rest_delete_tunnel" {
   source_arn    = "${aws_apigatewayv2_api.rest_api.execution_arn}/*/*"
 }
 
-# HTTP Proxy route for accessing tunnels
+# HTTP proxy traffic (/t/*) is intentionally NOT routed through this REST API.
+# All proxy requests must go through CloudFront → Lambda Function URL (RESPONSE_STREAM),
+# which has no 6 MB response limit. Routing proxy requests through the REST API would
+# invoke the Lambda in buffered mode and hit the 6,291,456-byte payload limit.
+#
+# The Lambda Function URL is: aws_lambda_function_url.http_proxy.function_url
+# CloudFront origin points to that URL (see cloudfront.tf).
+
+# The http_proxy integration is still needed for the upload-url + poll endpoints below,
+# which only handle small JSON payloads (no video bodies go through them).
 resource "aws_apigatewayv2_integration" "http_proxy" {
   api_id                 = aws_apigatewayv2_api.rest_api.id
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.http_proxy.invoke_arn
   payload_format_version = "2.0"
-}
-
-resource "aws_apigatewayv2_route" "http_proxy" {
-  api_id    = aws_apigatewayv2_api.rest_api.id
-  route_key = "ANY /t/{subdomain}/{proxy+}"
-  target    = "integrations/${aws_apigatewayv2_integration.http_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "http_proxy_root" {
-  api_id    = aws_apigatewayv2_api.rest_api.id
-  route_key = "ANY /t/{subdomain}"
-  target    = "integrations/${aws_apigatewayv2_integration.http_proxy.id}"
 }
 
 resource "aws_lambda_permission" "rest_http_proxy" {
@@ -269,4 +266,26 @@ resource "aws_lambda_permission" "rest_http_proxy" {
   function_name = aws_lambda_function.http_proxy.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.rest_api.execution_arn}/*/*"
+}
+
+# Upload-URL endpoint — clients call this (with no body) to get a presigned S3 PUT URL
+# for uploading request bodies larger than Lambda's 6 MB invocation limit.
+# Routes: POST /upload-url/{subdomain}/{proxy+} and POST /upload-url/{subdomain}
+resource "aws_apigatewayv2_route" "upload_url" {
+  api_id    = aws_apigatewayv2_api.rest_api.id
+  route_key = "POST /upload-url/{subdomain}/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.http_proxy.id}"
+}
+
+resource "aws_apigatewayv2_route" "upload_url_root" {
+  api_id    = aws_apigatewayv2_api.rest_api.id
+  route_key = "POST /upload-url/{subdomain}"
+  target    = "integrations/${aws_apigatewayv2_integration.http_proxy.id}"
+}
+
+# Poll endpoint — clients poll here after uploading to S3, waiting for the tunnel response.
+resource "aws_apigatewayv2_route" "poll_response" {
+  api_id    = aws_apigatewayv2_api.rest_api.id
+  route_key = "GET /poll/{request_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.http_proxy.id}"
 }

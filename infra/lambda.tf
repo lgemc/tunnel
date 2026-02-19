@@ -57,7 +57,17 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "execute-api:ManageConnections"
         ]
         Resource = "${aws_apigatewayv2_api.websocket_api.execution_arn}/*"
-      }
+      },
+      {
+        # Allow all Lambdas to read/write staged request & response bodies in S3.
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "${aws_s3_bucket.uploads.arn}/*"
+      },
     ]
   })
 }
@@ -226,6 +236,7 @@ resource "aws_lambda_function" "http_proxy" {
       PENDING_REQUESTS_TABLE = aws_dynamodb_table.pending_requests.name
       WEBSOCKET_ENDPOINT     = "${replace(aws_apigatewayv2_api.websocket_api.api_endpoint, "wss://", "https://")}/${aws_apigatewayv2_stage.websocket_api.name}"
       DOMAIN_NAME            = var.domain_name
+      UPLOADS_BUCKET         = aws_s3_bucket.uploads.bucket
       ENVIRONMENT            = var.environment
     }
   }
@@ -409,4 +420,70 @@ resource "aws_lambda_permission" "function_url_public_invoke" {
 output "http_proxy_function_url" {
   value       = aws_lambda_function_url.http_proxy.function_url
   description = "Lambda Function URL for http-proxy (streaming)"
+}
+
+# ── s3-upload-notify Lambda ──────────────────────────────────────────────────
+# Triggered by S3 ObjectCreated events on the uploads bucket.
+# Reads the request metadata stored as S3 object tags, looks up the active
+# tunnel connection in DynamoDB, and forwards the proxy request to the CLI via
+# WebSocket so the CLI can download the body from S3 and forward it to localhost.
+
+resource "aws_lambda_function" "s3_upload_notify" {
+  function_name = "${var.project_name}-s3-upload-notify-${var.environment}"
+  role          = aws_iam_role.lambda_execution.arn
+  handler       = "bootstrap"
+  runtime       = "provided.al2023"
+  timeout       = 180 # must wait for CLI response
+  memory_size   = var.lambda_memory_size
+
+  filename         = data.archive_file.s3_upload_notify_placeholder.output_path
+  source_code_hash = data.archive_file.s3_upload_notify_placeholder.output_base64sha256
+
+  environment {
+    variables = {
+      DOMAINS_TABLE          = aws_dynamodb_table.domains.name
+      TUNNELS_TABLE          = aws_dynamodb_table.tunnels.name
+      PENDING_REQUESTS_TABLE = aws_dynamodb_table.pending_requests.name
+      WEBSOCKET_ENDPOINT     = "${replace(aws_apigatewayv2_api.websocket_api.api_endpoint, "wss://", "https://")}/${aws_apigatewayv2_stage.websocket_api.name}"
+      UPLOADS_BUCKET         = aws_s3_bucket.uploads.bucket
+      ENVIRONMENT            = var.environment
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_group" "s3_upload_notify" {
+  name              = "/aws/lambda/${aws_lambda_function.s3_upload_notify.function_name}"
+  retention_in_days = 7
+}
+
+# Allow S3 to invoke the s3-upload-notify Lambda
+resource "aws_lambda_permission" "s3_upload_notify" {
+  statement_id  = "AllowS3Invoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.s3_upload_notify.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.uploads.arn
+}
+
+# S3 → Lambda event notification: fire on every new object under requests/
+resource "aws_s3_bucket_notification" "upload_notify" {
+  bucket = aws_s3_bucket.uploads.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.s3_upload_notify.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "requests/"
+  }
+
+  depends_on = [aws_lambda_permission.s3_upload_notify]
+}
+
+data "archive_file" "s3_upload_notify_placeholder" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/lambda-placeholders/s3-upload-notify.zip"
+
+  source {
+    content  = "placeholder"
+    filename = "bootstrap"
+  }
 }

@@ -219,6 +219,36 @@ func handleProxyResponse(ctx context.Context, message models.WebSocketMessage) (
 		headersAV[k] = &types.AttributeValueMemberS{Value: v}
 	}
 
+	// If the CLI uploaded the response body to S3, store the key and flag as ready.
+	// The http-proxy Lambda will fetch from S3 instead of reading response_body.
+	s3ResponseKey, _ := message.Data["s3_response_key"].(string)
+	if s3ResponseKey != "" {
+		log.Printf("proxy_response: request_id=%s using S3 response key %s", requestID, s3ResponseKey)
+		err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(pendingRequestsTable),
+			Key: map[string]types.AttributeValue{
+				"request_id": &types.AttributeValueMemberS{Value: requestID},
+			},
+			UpdateExpression: aws.String("SET #s = :status, response_status = :code, response_headers = :headers, s3_response_key = :s3k, s3_response_ready = :ready"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":status":  &types.AttributeValueMemberS{Value: "completed"},
+				":code":    &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", statusCode)},
+				":headers": &types.AttributeValueMemberM{Value: headersAV},
+				":s3k":     &types.AttributeValueMemberS{Value: s3ResponseKey},
+				":ready":   &types.AttributeValueMemberBOOL{Value: true},
+			},
+		})
+		if err != nil {
+			log.Printf("proxy_response: failed to store S3 response key for request_id=%s: %v", requestID, err)
+			return errorResponse(500, fmt.Sprintf("Failed to update pending request: %v", err))
+		}
+		log.Printf("proxy_response: request_id=%s marked completed with S3 body (status=%d)", requestID, statusCode)
+		return events.APIGatewayProxyResponse{StatusCode: 200, Body: `{"message": "Proxy response processed (S3)"}`}, nil
+	}
+
 	// Use UpdateItem to atomically set only the response fields (no GetItem needed)
 	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(pendingRequestsTable),

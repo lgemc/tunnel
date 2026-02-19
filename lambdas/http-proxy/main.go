@@ -18,7 +18,9 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/apigatewaymanagementapi"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/lmanrique/tunnel/lambdas/shared/db"
 	"github.com/lmanrique/tunnel/lambdas/shared/models"
 )
@@ -29,7 +31,10 @@ var (
 	pendingRequestsTable string
 	websocketEndpoint    string
 	domainName           string
+	uploadsBucket        string
 	dbClient             *db.DynamoDBClient
+	s3Client             *s3.Client
+	s3PresignClient      *s3.PresignClient
 )
 
 func init() {
@@ -38,6 +43,7 @@ func init() {
 	pendingRequestsTable = os.Getenv("PENDING_REQUESTS_TABLE")
 	websocketEndpoint = os.Getenv("WEBSOCKET_ENDPOINT")
 	domainName = os.Getenv("DOMAIN_NAME")
+	uploadsBucket = os.Getenv("UPLOADS_BUCKET")
 
 	if domainsTable == "" || tunnelsTable == "" || pendingRequestsTable == "" || websocketEndpoint == "" || domainName == "" {
 		panic("Required environment variables are missing")
@@ -68,28 +74,63 @@ type PendingRequest struct {
 }
 
 func generateRequestID() (string, error) {
-	bytes := make([]byte, 16)
-	if _, err := rand.Read(bytes); err != nil {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(bytes), nil
+	return hex.EncodeToString(b), nil
 }
 
-func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
-	// Initialize DB client if not already done
+func initClients(ctx context.Context) error {
 	if dbClient == nil {
 		var err error
 		dbClient, err = db.NewDynamoDBClient(ctx)
 		if err != nil {
-			return errorResponse(500, fmt.Sprintf("Failed to initialize database: %v", err))
+			return fmt.Errorf("failed to initialize DynamoDB client: %w", err)
 		}
 	}
+	if s3Client == nil && uploadsBucket != "" {
+		cfg, err := dbClient.GetAWSConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get AWS config: %w", err)
+		}
+		s3Client = s3.NewFromConfig(cfg)
+		s3PresignClient = s3.NewPresignClient(s3Client)
+	}
+	return nil
+}
 
+func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
+	if err := initClients(ctx); err != nil {
+		return errorResponse(500, err.Error())
+	}
+
+	path := request.RawPath
+
+	// ── Poll endpoint: GET /poll/{request_id} ────────────────────────────────
+	if strings.HasPrefix(path, "/poll/") {
+		requestID := strings.TrimPrefix(path, "/poll/")
+		if requestID == "" {
+			return errorResponse(400, "request_id is required")
+		}
+		return handlePollResponse(ctx, requestID)
+	}
+
+	// ── Upload-URL endpoint: POST /upload-url/{subdomain}[/{proxy+}] ─────────
+	if strings.HasPrefix(path, "/upload-url/") {
+		return handleUploadURL(ctx, request)
+	}
+
+	// ── Normal proxy: /t/{subdomain}[/{proxy+}] ──────────────────────────────
+	return handleProxy(ctx, request)
+}
+
+// handleProxy is the main tunnel proxy path (unchanged behaviour for normal requests).
+func handleProxy(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
 	// Extract subdomain — from path parameters (API Gateway) or raw path (Lambda Function URL)
 	subdomain := request.PathParameters["subdomain"]
 	proxyPath := ""
 	if subdomain == "" {
-		// Lambda Function URL: path looks like /t/{subdomain}/rest/of/path
 		trimmed := strings.TrimPrefix(request.RawPath, "/t/")
 		if trimmed == request.RawPath || trimmed == "" {
 			return errorResponse(400, "Subdomain is required")
@@ -103,7 +144,6 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 			proxyPath = trimmed[slashIdx:]
 		}
 	} else {
-		// API Gateway: use path parameters
 		pp := request.PathParameters["proxy"]
 		if pp == "" {
 			proxyPath = "/"
@@ -128,46 +168,50 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 		body = string(decoded)
 	}
 
-	// Look up domain to get tunnel ID
+	// Look up domain → tunnel
 	fullDomain := fmt.Sprintf("%s.%s", subdomain, domainName)
 	key := map[string]types.AttributeValue{
 		"domain": &types.AttributeValueMemberS{Value: fullDomain},
 	}
 
 	var domain models.Domain
-	err := dbClient.GetItem(ctx, domainsTable, key, &domain)
-	if err != nil {
+	if err := dbClient.GetItem(ctx, domainsTable, key, &domain); err != nil {
 		return errorResponse(404, "Tunnel not found")
 	}
 
-	// Get tunnel details
 	tunnelKey := map[string]types.AttributeValue{
 		"tunnel_id": &types.AttributeValueMemberS{Value: domain.TunnelID},
 	}
-
 	var tunnel models.Tunnel
-	err = dbClient.GetItem(ctx, tunnelsTable, tunnelKey, &tunnel)
-	if err != nil {
+	if err := dbClient.GetItem(ctx, tunnelsTable, tunnelKey, &tunnel); err != nil {
 		return errorResponse(404, "Tunnel not found")
 	}
-
-	// Check if tunnel is active
 	if tunnel.Status != models.TunnelStatusActive {
 		return errorResponse(503, "Tunnel is not active")
 	}
-
-	// Check if tunnel has a connection
 	if tunnel.ConnectionID == "" {
 		return errorResponse(503, "Tunnel is not connected")
 	}
 
-	// Generate unique request ID
 	requestID, err := generateRequestID()
 	if err != nil {
 		return errorResponse(500, "Failed to generate request ID")
 	}
 
-	// Store request in DynamoDB
+	// Pre-generate a presigned S3 PUT URL so the CLI can stage large/binary responses.
+	s3PutURL, s3ResponseKey := "", ""
+	if uploadsBucket != "" {
+		s3ResponseKey = fmt.Sprintf("responses/%s/body", requestID)
+		presignReq, presignErr := s3PresignClient.PresignPutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(uploadsBucket),
+			Key:    aws.String(s3ResponseKey),
+		}, s3.WithPresignExpires(30*time.Minute))
+		if presignErr == nil {
+			s3PutURL = presignReq.URL
+		}
+	}
+
+	// Store pending request in DynamoDB
 	pendingReq := PendingRequest{
 		RequestID: requestID,
 		TunnelID:  domain.TunnelID,
@@ -177,26 +221,24 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 		Body:      body,
 		Status:    "pending",
 		CreatedAt: time.Now(),
-		TTL:       time.Now().Add(5 * time.Minute).Unix(), // Auto-delete after 5 minutes
+		TTL:       time.Now().Add(5 * time.Minute).Unix(),
 	}
-
 	if err := dbClient.PutItem(ctx, pendingRequestsTable, pendingReq); err != nil {
 		return errorResponse(500, fmt.Sprintf("Failed to store request: %v", err))
 	}
 
-	// Send request through WebSocket
+	// Build API Gateway management client
 	cfg, err := dbClient.GetAWSConfig(ctx)
 	if err != nil {
 		return errorResponse(500, "Failed to get AWS config")
 	}
-
 	apigwClient := apigatewaymanagementapi.NewFromConfig(cfg, func(o *apigatewaymanagementapi.Options) {
 		o.BaseEndpoint = aws.String(websocketEndpoint)
 	})
 
-	const wsChunkSize = 90 * 1024 // 90KB — stays under API Gateway's 128KB WebSocket message limit
+	const wsChunkSize = 90 * 1024
 
-	// If body is large, send it in chunks before the main proxy message
+	// If request body is large, send it to the CLI in chunks before the main message
 	totalChunks := 0
 	proxyBody := body
 	if len(body) > wsChunkSize {
@@ -218,25 +260,26 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 			if err != nil {
 				return errorResponse(500, "Failed to marshal request chunk")
 			}
-			_, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
+			if _, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
 				ConnectionId: aws.String(tunnel.ConnectionID),
 				Data:         chunkPayload,
-			})
-			if err != nil {
+			}); err != nil {
 				return errorResponse(500, fmt.Sprintf("Failed to send request chunk to tunnel: %v", err))
 			}
 		}
-		proxyBody = "" // body will be assembled by CLI from chunks
+		proxyBody = ""
 	}
 
-	// Send request to WebSocket connection
+	// Send main proxy message (includes presigned S3 URL for large responses)
 	proxyReq := map[string]interface{}{
-		"request_id":   requestID,
-		"method":       request.RequestContext.HTTP.Method,
-		"path":         proxyPath,
-		"headers":      request.Headers,
-		"body":         proxyBody,
-		"total_chunks": totalChunks,
+		"request_id":      requestID,
+		"method":          request.RequestContext.HTTP.Method,
+		"path":            proxyPath,
+		"headers":         request.Headers,
+		"body":            proxyBody,
+		"total_chunks":    totalChunks,
+		"s3_put_url":      s3PutURL,
+		"s3_response_key": s3ResponseKey,
 	}
 
 	payloadBytes, err := json.Marshal(map[string]interface{}{
@@ -246,16 +289,200 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 	if err != nil {
 		return errorResponse(500, "Failed to marshal request")
 	}
-
-	_, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
+	if _, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
 		ConnectionId: aws.String(tunnel.ConnectionID),
 		Data:         payloadBytes,
-	})
-	if err != nil {
+	}); err != nil {
 		return errorResponse(500, fmt.Sprintf("Failed to send request to tunnel: %v", err))
 	}
 
-	// Poll for response — detect streaming or buffered completion (50ms interval, 3min timeout)
+	return pollAndReturn(ctx, requestID)
+}
+
+// handleUploadURL generates a presigned S3 PUT URL for a large request body upload.
+// The client calls POST /upload-url/{subdomain}/{proxy+} with JSON metadata in the body,
+// uploads the actual file to the returned presigned URL, then polls GET /poll/{request_id}.
+func handleUploadURL(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
+	if uploadsBucket == "" {
+		return errorResponse(503, "Large upload support not configured (UPLOADS_BUCKET missing)")
+	}
+
+	// Parse subdomain from path: /upload-url/{subdomain}[/{proxy+}]
+	trimmed := strings.TrimPrefix(request.RawPath, "/upload-url/")
+	if trimmed == "" {
+		return errorResponse(400, "Subdomain is required")
+	}
+	subdomain := trimmed
+	proxyPath := "/"
+	if idx := strings.Index(trimmed, "/"); idx != -1 {
+		subdomain = trimmed[:idx]
+		proxyPath = trimmed[idx:]
+	}
+
+	// Parse optional metadata from body (method, content-type, headers)
+	var meta struct {
+		Method      string            `json:"method"`
+		ContentType string            `json:"content_type"`
+		Headers     map[string]string `json:"headers"`
+	}
+	meta.Method = "POST"
+	if request.Body != "" {
+		_ = json.Unmarshal([]byte(request.Body), &meta)
+	}
+	if meta.Method == "" {
+		meta.Method = "POST"
+	}
+	if request.RawQueryString != "" {
+		proxyPath = proxyPath + "?" + request.RawQueryString
+	}
+
+	// Look up domain → tunnel (must be active before issuing URL)
+	fullDomain := fmt.Sprintf("%s.%s", subdomain, domainName)
+	var domain models.Domain
+	if err := dbClient.GetItem(ctx, domainsTable, map[string]types.AttributeValue{
+		"domain": &types.AttributeValueMemberS{Value: fullDomain},
+	}, &domain); err != nil {
+		return errorResponse(404, "Tunnel not found")
+	}
+	var tunnel models.Tunnel
+	if err := dbClient.GetItem(ctx, tunnelsTable, map[string]types.AttributeValue{
+		"tunnel_id": &types.AttributeValueMemberS{Value: domain.TunnelID},
+	}, &tunnel); err != nil {
+		return errorResponse(404, "Tunnel not found")
+	}
+	if tunnel.Status != models.TunnelStatusActive {
+		return errorResponse(503, "Tunnel is not active")
+	}
+
+	requestID, err := generateRequestID()
+	if err != nil {
+		return errorResponse(500, "Failed to generate request ID")
+	}
+
+	// S3 key encodes the request_id so the s3-upload-notify Lambda can look it up
+	s3RequestKey := fmt.Sprintf("requests/%s/body", requestID)
+
+	// Also pre-generate a presigned PUT URL for the CLI's response (same as handleProxy)
+	s3ResponseKey := fmt.Sprintf("responses/%s/body", requestID)
+	s3ResponsePutURL := ""
+	responsePutReq, err := s3PresignClient.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(uploadsBucket),
+		Key:    aws.String(s3ResponseKey),
+	}, s3.WithPresignExpires(30*time.Minute))
+	if err == nil {
+		s3ResponsePutURL = responsePutReq.URL
+	}
+
+	// Build the presigned PUT URL for the request body (what the caller uses to upload)
+	putInput := &s3.PutObjectInput{
+		Bucket: aws.String(uploadsBucket),
+		Key:    aws.String(s3RequestKey),
+		// Store tunnel + request metadata as S3 object tags so the notify Lambda can recover them
+		Tagging: aws.String(fmt.Sprintf(
+			"request_id=%s&tunnel_id=%s&method=%s&subdomain=%s",
+			requestID, domain.TunnelID, meta.Method, subdomain,
+		)),
+	}
+	if meta.ContentType != "" {
+		putInput.ContentType = aws.String(meta.ContentType)
+	}
+	presignReq, err := s3PresignClient.PresignPutObject(ctx, putInput,
+		s3.WithPresignExpires(30*time.Minute),
+	)
+	if err != nil {
+		return errorResponse(500, fmt.Sprintf("Failed to generate presigned URL: %v", err))
+	}
+
+	// Create pending request (status: waiting_upload)
+	pendingReq := PendingRequest{
+		RequestID: requestID,
+		TunnelID:  domain.TunnelID,
+		Method:    meta.Method,
+		Path:      proxyPath,
+		Headers:   meta.Headers,
+		Body:      "", // body will arrive via S3
+		Status:    "waiting_upload",
+		CreatedAt: time.Now(),
+		TTL:       time.Now().Add(30 * time.Minute).Unix(),
+	}
+	if meta.Headers == nil {
+		pendingReq.Headers = map[string]string{}
+	}
+	if err := dbClient.PutItem(ctx, pendingRequestsTable, pendingReq); err != nil {
+		return errorResponse(500, fmt.Sprintf("Failed to store pending request: %v", err))
+	}
+
+	// Also store the s3_response_key and s3_response_put_url so the notify Lambda
+	// can include them in the WebSocket message to the CLI
+	_ = dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(pendingRequestsTable),
+		Key: map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		},
+		UpdateExpression: aws.String("SET s3_request_key = :rk, s3_response_key = :respk, s3_response_put_url = :respurl"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":rk":      &types.AttributeValueMemberS{Value: s3RequestKey},
+			":respk":   &types.AttributeValueMemberS{Value: s3ResponseKey},
+			":respurl": &types.AttributeValueMemberS{Value: s3ResponsePutURL},
+		},
+	})
+
+	resp := map[string]string{
+		"request_id": requestID,
+		"upload_url": presignReq.URL,
+		"poll_url":   fmt.Sprintf("/poll/%s", requestID),
+	}
+	body, _ := json.Marshal(resp)
+	return &events.LambdaFunctionURLStreamingResponse{
+		StatusCode: 200,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       bytes.NewReader(body),
+	}, nil
+}
+
+// handlePollResponse polls DynamoDB for the response to a previously initiated upload request.
+func handlePollResponse(ctx context.Context, requestID string) (*events.LambdaFunctionURLStreamingResponse, error) {
+	reqKey := map[string]types.AttributeValue{
+		"request_id": &types.AttributeValueMemberS{Value: requestID},
+	}
+
+	// Check it exists
+	rawItem, err := dbClient.GetRawItem(ctx, pendingRequestsTable, reqKey)
+	if err != nil || rawItem == nil {
+		return errorResponse(404, "Request not found")
+	}
+
+	statusAV, ok := rawItem["status"]
+	if !ok {
+		return errorResponse(404, "Request not found")
+	}
+	sv, _ := statusAV.(*types.AttributeValueMemberS)
+	if sv == nil {
+		return errorResponse(404, "Request not found")
+	}
+
+	switch sv.Value {
+	case "pending", "waiting_upload":
+		body, _ := json.Marshal(map[string]string{"status": sv.Value})
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: 202,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			Body:       bytes.NewReader(body),
+		}, nil
+	case "completed":
+		return buildBufferedResponseFromItem(ctx, rawItem)
+	default:
+		body, _ := json.Marshal(map[string]string{"status": sv.Value})
+		return &events.LambdaFunctionURLStreamingResponse{
+			StatusCode: 202,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			Body:       bytes.NewReader(body),
+		}, nil
+	}
+}
+
+// pollAndReturn waits for the CLI to complete the request and builds the appropriate response.
+func pollAndReturn(ctx context.Context, requestID string) (*events.LambdaFunctionURLStreamingResponse, error) {
 	pollTimeout := time.After(180 * time.Second)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -274,21 +501,73 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 				continue
 			}
 
-			// SSE / streaming response detected
+			// SSE / streaming response
 			if isStreamingAV, ok := rawItem["is_streaming"]; ok {
 				if bv, ok := isStreamingAV.(*types.AttributeValueMemberBOOL); ok && bv.Value {
 					return buildStreamingResponse(ctx, requestID, rawItem)
 				}
 			}
 
-			// Buffered (non-streaming) response completed
+			// S3-staged response (large/binary body)
+			if s3KeyAV, ok := rawItem["s3_response_key"]; ok {
+				if sv, ok := s3KeyAV.(*types.AttributeValueMemberS); ok && sv.Value != "" {
+					// Only act once the CLI has confirmed it uploaded to S3
+					if doneAV, ok2 := rawItem["s3_response_ready"]; ok2 {
+						if bv, ok3 := doneAV.(*types.AttributeValueMemberBOOL); ok3 && bv.Value {
+							return buildS3StreamingResponse(ctx, rawItem, sv.Value)
+						}
+					}
+				}
+			}
+
+			// Buffered response completed
 			if statusAV, ok := rawItem["status"]; ok {
 				if sv, ok := statusAV.(*types.AttributeValueMemberS); ok && sv.Value == "completed" {
-					return buildBufferedResponse(rawItem)
+					return buildBufferedResponseFromItem(ctx, rawItem)
 				}
 			}
 		}
 	}
+}
+
+// buildS3StreamingResponse fetches the response body from S3 and pipes it to the caller.
+func buildS3StreamingResponse(ctx context.Context, rawItem map[string]types.AttributeValue, s3Key string) (*events.LambdaFunctionURLStreamingResponse, error) {
+	statusCode := 200
+	if sc, ok := rawItem["response_status"]; ok {
+		if nv, ok := sc.(*types.AttributeValueMemberN); ok {
+			statusCode, _ = strconv.Atoi(nv.Value)
+		}
+	}
+
+	headers := map[string]string{}
+	if h, ok := rawItem["response_headers"]; ok {
+		if mv, ok := h.(*types.AttributeValueMemberM); ok {
+			for k, v := range mv.Value {
+				if sv, ok := v.(*types.AttributeValueMemberS); ok {
+					headers[k] = sv.Value
+				}
+			}
+		}
+	}
+
+	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(uploadsBucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		return errorResponse(502, fmt.Sprintf("Failed to fetch response from S3: %v", err))
+	}
+
+	// Set Content-Length from S3 object if not already in headers
+	if _, ok := headers["Content-Length"]; !ok && result.ContentLength != nil {
+		headers["Content-Length"] = strconv.FormatInt(*result.ContentLength, 10)
+	}
+
+	return &events.LambdaFunctionURLStreamingResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       result.Body, // S3 GetObject body is already an io.ReadCloser
+	}, nil
 }
 
 // buildStreamingResponse creates a pipe-backed streaming response that forwards
@@ -367,7 +646,6 @@ func buildStreamingResponse(ctx context.Context, requestID string, firstItem map
 						}
 						removeExpr += alias
 					}
-					// Fire-and-forget; ignore errors (chunks will be TTL-deleted anyway)
 					_ = dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 						TableName:                aws.String(pendingRequestsTable),
 						Key:                      reqKey,
@@ -391,6 +669,21 @@ func buildStreamingResponse(ctx context.Context, requestID string, firstItem map
 		Headers:    headers,
 		Body:       pr,
 	}, nil
+}
+
+// buildBufferedResponseFromItem returns a completed buffered response.
+func buildBufferedResponseFromItem(ctx context.Context, rawItem map[string]types.AttributeValue) (*events.LambdaFunctionURLStreamingResponse, error) {
+	// Check for S3-staged response first (large body)
+	if s3KeyAV, ok := rawItem["s3_response_key"]; ok {
+		if sv, ok := s3KeyAV.(*types.AttributeValueMemberS); ok && sv.Value != "" {
+			if doneAV, ok2 := rawItem["s3_response_ready"]; ok2 {
+				if bv, ok3 := doneAV.(*types.AttributeValueMemberBOOL); ok3 && bv.Value {
+					return buildS3StreamingResponse(ctx, rawItem, sv.Value)
+				}
+			}
+		}
+	}
+	return buildBufferedResponse(rawItem)
 }
 
 // buildBufferedResponse returns the full body at once for non-streaming responses.

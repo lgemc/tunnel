@@ -19,6 +19,22 @@ import (
 
 const chunkSize = 90 * 1024 // 90KB — stays under API Gateway's 128KB WebSocket message limit
 
+// s3UploadThreshold is the response body size above which the CLI stages the
+// response in S3 instead of sending it through DynamoDB (400 KB item limit).
+const s3UploadThreshold = 256 * 1024 // 256 KB
+
+// isBinaryContentType reports whether ct is a binary media type that should
+// be staged through S3 rather than DynamoDB regardless of size.
+func isBinaryContentType(ct string) bool {
+	ct = strings.ToLower(ct)
+	for _, prefix := range []string{"video/", "audio/", "image/", "application/octet-stream", "application/pdf", "application/zip"} {
+		if strings.Contains(ct, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Proxy represents a local HTTP proxy
 type Proxy struct {
 	LocalPort      int
@@ -304,6 +320,23 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	method, _ := dataMap["method"].(string)
 	path, _ := dataMap["path"].(string)
 	body, _ := dataMap["body"].(string)
+	// Presigned S3 URL provided by the Lambda for staging large/binary responses
+	s3PutURL, _ := dataMap["s3_put_url"].(string)
+	s3ResponseKey, _ := dataMap["s3_response_key"].(string)
+	// For large inbound uploads: the request body is in S3 instead of in the message
+	s3RequestGetURL, _ := dataMap["s3_request_get_url"].(string)
+
+	// If body is in S3 (large upload flow), download it now
+	if s3RequestGetURL != "" && body == "" {
+		downloaded, dlErr := p.downloadFromS3(ctx, s3RequestGetURL)
+		if dlErr != nil {
+			log.Printf("Failed to download request body from S3 for request %s: %v", requestID, dlErr)
+			p.sendProxyErrorResponse(requestID, fmt.Sprintf("Failed to download request body: %v", dlErr))
+			return
+		}
+		body = string(downloaded)
+		log.Printf("Downloaded %d byte request body from S3 for request %s", len(body), requestID)
+	}
 
 	// If body was chunked, assemble it from buffered chunks
 	if totalChunksF, ok := dataMap["total_chunks"].(float64); ok && totalChunksF > 0 {
@@ -357,7 +390,7 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 		return
 	}
 
-	// Detect SSE / streaming responses and handle progressively
+	// Detect SSE streaming responses and handle progressively.
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		log.Printf("Detected SSE streaming response for request %s, forwarding progressively", requestID)
 		p.streamProxyResponse(ctx, requestID, resp)
@@ -378,13 +411,42 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	responseHeaders := make(map[string]string)
 	for k, v := range resp.Header {
 		if len(v) > 0 {
-			responseHeaders[k] = v[0] // Take first value
+			responseHeaders[k] = v[0]
+		}
+	}
+
+	// For large or binary responses, upload the body directly to S3 and notify
+	// the Lambda via the proxy_response message (s3_response_key).
+	// This avoids the DynamoDB 400 KB item-size limit and the per-message chunking overhead.
+	if s3PutURL != "" && s3ResponseKey != "" &&
+		(len(respBody) > s3UploadThreshold || isBinaryContentType(resp.Header.Get("Content-Type"))) {
+		if err := p.uploadToS3(ctx, s3PutURL, resp.Header.Get("Content-Type"), respBody); err != nil {
+			log.Printf("Failed to upload response to S3 for request %s: %v — falling back to inline", requestID, err)
+			// Fall through to inline path on error
+		} else {
+			log.Printf("Uploaded %d byte response to S3 for request %s", len(respBody), requestID)
+			responseMessage := WebSocketMessage{
+				Action: "proxy_response",
+				Data: map[string]interface{}{
+					"request_id":       requestID,
+					"status_code":      resp.StatusCode,
+					"response_headers": responseHeaders,
+					"response_body":    "",
+					"s3_response_key":  s3ResponseKey,
+				},
+			}
+			if err := p.sendWebSocketMessage(responseMessage); err != nil {
+				log.Printf("Failed to send S3 proxy response for request %s: %v", requestID, err)
+			} else {
+				log.Printf("Sent S3 proxy response for request %s (status: %d)", requestID, resp.StatusCode)
+			}
+			return
 		}
 	}
 
 	bodyStr := string(respBody)
 
-	// Check total serialized message size (body + JSON wrapper + headers) against the 128KB limit
+	// Check total serialized message size against the 128 KB WebSocket limit
 	testMsg := WebSocketMessage{
 		Action: "proxy_response",
 		Data: map[string]interface{}{
@@ -398,7 +460,6 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 
 	// If total message exceeds WebSocket message limit, send body in chunks
 	if len(testBytes) > 128*1024 {
-		// Calculate effective chunk size accounting for non-body overhead
 		overhead := len(testBytes) - len(bodyStr)
 		effectiveChunkSize := 120*1024 - overhead
 		if effectiveChunkSize <= 0 || effectiveChunkSize > chunkSize {
@@ -426,7 +487,6 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 				return
 			}
 		}
-		// Send final message with metadata only (body assembled from chunks by Lambda)
 		responseMessage := WebSocketMessage{
 			Action: "proxy_response",
 			Data: map[string]interface{}{
@@ -445,7 +505,7 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 		return
 	}
 
-	// Send response back through WebSocket (reuse already-marshaled testBytes)
+	// Small response — send inline via WebSocket
 	p.writeMux.Lock()
 	err = p.conn.WriteMessage(websocket.TextMessage, testBytes)
 	p.writeMux.Unlock()
@@ -456,7 +516,48 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	}
 }
 
-// streamProxyResponse handles SSE / chunked responses by forwarding each line progressively
+// uploadToS3 performs an HTTP PUT of body to a presigned S3 URL.
+func (p *Proxy) uploadToS3(ctx context.Context, presignedURL, contentType string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create S3 PUT request: %w", err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.ContentLength = int64(len(body))
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("S3 PUT failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("S3 PUT returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// downloadFromS3 performs an HTTP GET from a presigned S3 URL and returns the body.
+func (p *Proxy) downloadFromS3(ctx context.Context, presignedURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, presignedURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create S3 GET request: %w", err)
+	}
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("S3 GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("S3 GET returned status %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// streamProxyResponse handles SSE responses by forwarding each event progressively
 // via WebSocket using proxy_stream_start, proxy_stream_chunk, and proxy_stream_end messages.
 func (p *Proxy) streamProxyResponse(ctx context.Context, requestID string, resp *http.Response) {
 	defer resp.Body.Close()
