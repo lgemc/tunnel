@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -93,6 +94,19 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 	} else {
 		proxyPath = "/" + proxyPath
 	}
+	if request.RawQueryString != "" {
+		proxyPath = proxyPath + "?" + request.RawQueryString
+	}
+
+	// Decode body if API Gateway base64-encoded it
+	body := request.Body
+	if request.IsBase64Encoded {
+		decoded, err := base64.StdEncoding.DecodeString(body)
+		if err != nil {
+			return errorResponse(400, "Failed to decode request body")
+		}
+		body = string(decoded)
+	}
 
 	// Look up domain to get tunnel ID
 	fullDomain := fmt.Sprintf("%s.%s", subdomain, domainName)
@@ -140,7 +154,7 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		Method:    request.RequestContext.HTTP.Method,
 		Path:      proxyPath,
 		Headers:   request.Headers,
-		Body:      request.Body,
+		Body:      body,
 		Status:    "pending",
 		CreatedAt: time.Now(),
 		TTL:       time.Now().Add(5 * time.Minute).Unix(), // Auto-delete after 5 minutes
@@ -156,7 +170,7 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		Method:    request.RequestContext.HTTP.Method,
 		Path:      proxyPath,
 		Headers:   request.Headers,
-		Body:      request.Body,
+		Body:      body,
 	}
 
 	payloadBytes, err := json.Marshal(map[string]interface{}{

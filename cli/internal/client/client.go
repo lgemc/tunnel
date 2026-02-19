@@ -44,6 +44,7 @@ type CreateTunnelResponse struct {
 	WebsocketURL string `json:"websocket_url"`
 	Status       string `json:"status"`
 	Message      string `json:"message"`
+	Reused       bool   `json:"reused,omitempty"`
 }
 
 // Tunnel represents a tunnel
@@ -123,7 +124,7 @@ func (c *Client) CreateTunnel(subdomain string) (*CreateTunnelResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		var errResp ErrorResponse
 		if err := json.Unmarshal(body, &errResp); err != nil {

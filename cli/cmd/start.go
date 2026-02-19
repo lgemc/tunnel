@@ -58,7 +58,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Create API client
 	apiClient := client.NewClient(cfg.APIEndpoint, cfg.APIKey)
 
-	fmt.Printf("Creating tunnel for port %d...\n", port)
+	if subdomain != "" {
+		fmt.Printf("Connecting to tunnel for port %d (subdomain: %s)...\n", port, subdomain)
+	} else {
+		fmt.Printf("Creating tunnel for port %d...\n", port)
+	}
 
 	// Create tunnel
 	tunnel, err := apiClient.CreateTunnel(subdomain)
@@ -66,7 +70,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create tunnel: %w", err)
 	}
 
-	fmt.Printf("\n✓ Tunnel created successfully!\n")
+	if tunnel.Reused {
+		fmt.Printf("\n✓ Reusing existing tunnel!\n")
+	} else {
+		fmt.Printf("\n✓ Tunnel created successfully!\n")
+	}
 	fmt.Printf("  Tunnel ID: %s\n", tunnel.TunnelID)
 	fmt.Printf("  Domain:    %s\n", tunnel.Domain)
 	fmt.Printf("  Status:    %s\n\n", tunnel.Status)

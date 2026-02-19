@@ -46,12 +46,13 @@ type CreateTunnelRequest struct {
 }
 
 type CreateTunnelResponse struct {
-	TunnelID      string `json:"tunnel_id"`
-	Domain        string `json:"domain"`
-	Subdomain     string `json:"subdomain"`
-	WebsocketURL  string `json:"websocket_url"`
-	Status        string `json:"status"`
-	Message       string `json:"message"`
+	TunnelID     string `json:"tunnel_id"`
+	Domain       string `json:"domain"`
+	Subdomain    string `json:"subdomain"`
+	WebsocketURL string `json:"websocket_url"`
+	Status       string `json:"status"`
+	Message      string `json:"message"`
+	Reused       bool   `json:"reused,omitempty"`
 }
 
 func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
@@ -97,13 +98,17 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		}
 		subdomain = strings.ToLower(req.Subdomain)
 
-		// Check if subdomain is available
-		available, err := isSubdomainAvailable(ctx, subdomain)
+		// Check if subdomain is available; if taken by same client, reuse it
+		existingDomain, err := getExistingDomain(ctx, subdomain)
 		if err != nil {
 			return errorResponse(500, fmt.Sprintf("Failed to check subdomain availability: %v", err))
 		}
-		if !available {
-			return errorResponse(409, "Subdomain is already taken")
+		if existingDomain != nil {
+			if existingDomain.ClientID != clientID {
+				return errorResponse(409, "Subdomain is already taken")
+			}
+			// Same client — reuse the existing tunnel
+			return reuseExistingTunnel(ctx, existingDomain.TunnelID)
 		}
 	} else {
 		// Generate random subdomain
@@ -188,7 +193,7 @@ func verifyClientAPIKey(ctx context.Context, apiKey string) (string, error) {
 	return "", fmt.Errorf("client not found or inactive")
 }
 
-func isSubdomainAvailable(ctx context.Context, subdomain string) (bool, error) {
+func getExistingDomain(ctx context.Context, subdomain string) (*models.Domain, error) {
 	fullDomain := fmt.Sprintf("%s.%s", subdomain, domainName)
 
 	key := map[string]types.AttributeValue{
@@ -199,12 +204,37 @@ func isSubdomainAvailable(ctx context.Context, subdomain string) (bool, error) {
 	err := dbClient.GetItem(ctx, domainsTable, key, &domain)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			return true, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
 
-	return false, nil
+	return &domain, nil
+}
+
+func reuseExistingTunnel(ctx context.Context, tunnelID string) (events.APIGatewayV2HTTPResponse, error) {
+	key := map[string]types.AttributeValue{
+		"tunnel_id": &types.AttributeValueMemberS{Value: tunnelID},
+	}
+
+	var tunnel models.Tunnel
+	if err := dbClient.GetItem(ctx, tunnelsTable, key, &tunnel); err != nil {
+		return errorResponse(500, "Failed to get existing tunnel")
+	}
+
+	wsURL := fmt.Sprintf("%s/%s?tunnel_id=%s", websocketAPIURL, websocketAPIStage, tunnelID)
+
+	response := CreateTunnelResponse{
+		TunnelID:     tunnel.TunnelID,
+		Domain:       tunnel.Domain,
+		Subdomain:    tunnel.Subdomain,
+		WebsocketURL: wsURL,
+		Status:       tunnel.Status,
+		Message:      "Reusing existing tunnel.",
+		Reused:       true,
+	}
+
+	return successResponse(200, response)
 }
 
 func generateUniqueSubdomain(ctx context.Context) (string, error) {
@@ -215,12 +245,12 @@ func generateUniqueSubdomain(ctx context.Context) (string, error) {
 			return "", err
 		}
 
-		available, err := isSubdomainAvailable(ctx, subdomain)
+		existing, err := getExistingDomain(ctx, subdomain)
 		if err != nil {
 			return "", err
 		}
 
-		if available {
+		if existing == nil {
 			return subdomain, nil
 		}
 	}

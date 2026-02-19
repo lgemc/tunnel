@@ -24,6 +24,7 @@ type Proxy struct {
 	conn           *websocket.Conn
 	pendingReqs    map[string]chan *HTTPResponse
 	pendingReqsMux sync.RWMutex
+	writeMux       sync.Mutex
 	stopCh         chan struct{}
 }
 
@@ -198,7 +199,7 @@ func (p *Proxy) handleHTTPRequest(ctx context.Context, message WebSocketMessage)
 	}
 
 	// Make request to local service
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 180 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to make local request: %v", err)
@@ -257,6 +258,8 @@ func (p *Proxy) sendWebSocketMessage(message WebSocketMessage) error {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
+	p.writeMux.Lock()
+	defer p.writeMux.Unlock()
 	return p.conn.WriteMessage(websocket.TextMessage, messageBytes)
 }
 
@@ -308,7 +311,7 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	}
 
 	// Make request to local service
-	client := &http.Client{Timeout: 25 * time.Second}
+	client := &http.Client{Timeout: 180 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to make local request: %v", err)

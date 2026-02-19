@@ -245,9 +245,10 @@ resource "aws_lambda_permission" "rest_delete_tunnel" {
 
 # HTTP Proxy route for accessing tunnels
 resource "aws_apigatewayv2_integration" "http_proxy" {
-  api_id           = aws_apigatewayv2_api.rest_api.id
-  integration_type = "AWS_PROXY"
-  integration_uri  = aws_lambda_function.http_proxy.invoke_arn
+  api_id                 = aws_apigatewayv2_api.rest_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.http_proxy.invoke_arn
+  payload_format_version = "2.0"
 }
 
 resource "aws_apigatewayv2_route" "http_proxy" {
