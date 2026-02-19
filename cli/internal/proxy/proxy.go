@@ -15,6 +15,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const chunkSize = 90 * 1024 // 90KB — stays under API Gateway's 128KB WebSocket message limit
+
 // Proxy represents a local HTTP proxy
 type Proxy struct {
 	LocalPort      int
@@ -336,14 +338,59 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 		}
 	}
 
+	bodyStr := string(respBody)
+
+	// If body exceeds WebSocket message limit, send in chunks first
+	if len(bodyStr) > chunkSize {
+		totalChunks := (len(bodyStr) + chunkSize - 1) / chunkSize
+		log.Printf("Response body too large (%d bytes), sending in %d chunks for request %s", len(bodyStr), totalChunks, requestID)
+		for i := 0; i < totalChunks; i++ {
+			start := i * chunkSize
+			end := start + chunkSize
+			if end > len(bodyStr) {
+				end = len(bodyStr)
+			}
+			chunkMsg := WebSocketMessage{
+				Action: "proxy_response_chunk",
+				Data: map[string]interface{}{
+					"request_id":  requestID,
+					"chunk_index": i,
+					"data":        bodyStr[start:end],
+				},
+			}
+			if err := p.sendWebSocketMessage(chunkMsg); err != nil {
+				log.Printf("Failed to send chunk %d for request %s: %v", i, requestID, err)
+				p.sendProxyErrorResponse(requestID, fmt.Sprintf("Failed to send chunk: %v", err))
+				return
+			}
+		}
+		// Send final message with metadata only (body assembled from chunks by Lambda)
+		responseMessage := WebSocketMessage{
+			Action: "proxy_response",
+			Data: map[string]interface{}{
+				"request_id":       requestID,
+				"status_code":      resp.StatusCode,
+				"response_headers": responseHeaders,
+				"response_body":    "",
+				"total_chunks":     totalChunks,
+			},
+		}
+		if err := p.sendWebSocketMessage(responseMessage); err != nil {
+			log.Printf("Failed to send chunked proxy response for request %s: %v", requestID, err)
+		} else {
+			log.Printf("Sent chunked proxy response for request %s (status: %d, chunks: %d)", requestID, resp.StatusCode, totalChunks)
+		}
+		return
+	}
+
 	// Send response back through WebSocket
 	responseMessage := WebSocketMessage{
 		Action: "proxy_response",
 		Data: map[string]interface{}{
-			"request_id":      requestID,
-			"status_code":     resp.StatusCode,
+			"request_id":       requestID,
+			"status_code":      resp.StatusCode,
 			"response_headers": responseHeaders,
-			"response_body":   string(respBody),
+			"response_body":    bodyStr,
 		},
 	}
 

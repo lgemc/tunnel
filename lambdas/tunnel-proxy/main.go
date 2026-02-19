@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -61,6 +62,8 @@ func handler(ctx context.Context, request events.APIGatewayWebsocketProxyRequest
 		return handleResponse(ctx, message)
 	case "proxy_response":
 		return handleProxyResponse(ctx, message)
+	case "proxy_response_chunk":
+		return handleProxyResponseChunk(ctx, message)
 	default:
 		return errorResponse(400, fmt.Sprintf("Unknown message action: %s", message.Action))
 	}
@@ -119,6 +122,36 @@ func handleResponse(ctx context.Context, message models.WebSocketMessage) (event
 	}, nil
 }
 
+func handleProxyResponseChunk(ctx context.Context, message models.WebSocketMessage) (events.APIGatewayProxyResponse, error) {
+	requestID, _ := message.Data["request_id"].(string)
+	if requestID == "" {
+		return errorResponse(400, "Request ID is required")
+	}
+
+	chunkIndexF, _ := message.Data["chunk_index"].(float64)
+	chunkIndex := int(chunkIndexF)
+	data, _ := message.Data["data"].(string)
+
+	attrName := fmt.Sprintf("chunk_%d", chunkIndex)
+	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(pendingRequestsTable),
+		Key: map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		},
+		UpdateExpression:         aws.String("SET #chunk = :data"),
+		ExpressionAttributeNames: map[string]string{"#chunk": attrName},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":data": &types.AttributeValueMemberS{Value: data},
+		},
+	})
+	if err != nil {
+		log.Printf("proxy_response_chunk: failed to store chunk %d for request_id=%s: %v", chunkIndex, requestID, err)
+		return errorResponse(500, fmt.Sprintf("Failed to store chunk: %v", err))
+	}
+
+	return events.APIGatewayProxyResponse{StatusCode: 200, Body: `{"message":"chunk stored"}`}, nil
+}
+
 func handleProxyResponse(ctx context.Context, message models.WebSocketMessage) (events.APIGatewayProxyResponse, error) {
 	if pendingRequestsTable == "" {
 		log.Printf("proxy_response: PENDING_REQUESTS_TABLE not configured")
@@ -149,6 +182,30 @@ func handleProxyResponse(ctx context.Context, message models.WebSocketMessage) (
 	}
 
 	responseBody, _ := message.Data["response_body"].(string)
+
+	// If the response was chunked, assemble body from stored chunks
+	if totalChunksF, ok := message.Data["total_chunks"].(float64); ok && totalChunksF > 0 {
+		totalChunks := int(totalChunksF)
+		reqKey := map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		}
+		rawItem, err := dbClient.GetRawItem(ctx, pendingRequestsTable, reqKey)
+		if err != nil {
+			log.Printf("proxy_response: failed to read chunks for request_id=%s: %v", requestID, err)
+			return errorResponse(500, fmt.Sprintf("Failed to read chunks: %v", err))
+		}
+		var buf strings.Builder
+		for i := 0; i < totalChunks; i++ {
+			attrName := fmt.Sprintf("chunk_%d", i)
+			if av, ok := rawItem[attrName]; ok {
+				if sv, ok := av.(*types.AttributeValueMemberS); ok {
+					buf.WriteString(sv.Value)
+				}
+			}
+		}
+		responseBody = buf.String()
+		log.Printf("proxy_response: assembled %d chunks (%d bytes) for request_id=%s", totalChunks, len(responseBody), requestID)
+	}
 
 	// Build DynamoDB map for response headers
 	headersAV := map[string]types.AttributeValue{}

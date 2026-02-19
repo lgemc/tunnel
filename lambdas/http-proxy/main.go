@@ -199,8 +199,8 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		return errorResponse(500, fmt.Sprintf("Failed to send request to tunnel: %v", err))
 	}
 
-	// Poll for response (timeout after 25 seconds)
-	timeout := time.After(25 * time.Second)
+	// Poll for response (timeout after 3 minutes)
+	timeout := time.After(180 * time.Second)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 

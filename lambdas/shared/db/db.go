@@ -103,6 +103,23 @@ func (d *DynamoDBClient) Query(ctx context.Context, input *dynamodb.QueryInput, 
 	return nil
 }
 
+// GetRawItem retrieves a raw DynamoDB item without unmarshaling
+func (d *DynamoDBClient) GetRawItem(ctx context.Context, tableName string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error) {
+	output, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(tableName),
+		Key:       key,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get item: %w", err)
+	}
+
+	if output.Item == nil {
+		return nil, fmt.Errorf("item not found")
+	}
+
+	return output.Item, nil
+}
+
 // UpdateItem updates an item in a DynamoDB table
 func (d *DynamoDBClient) UpdateItem(ctx context.Context, input *dynamodb.UpdateItemInput) error {
 	_, err := d.client.UpdateItem(ctx, input)

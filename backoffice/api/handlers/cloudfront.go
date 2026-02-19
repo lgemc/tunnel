@@ -42,8 +42,10 @@ func (h *Handler) GetCloudFront(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, d := range out.DistributionList.Items {
 			info := DistributionInfo{
-				Enabled:    d.Enabled,
 				OriginCount: len(d.Origins.Items),
+			}
+			if d.Enabled != nil {
+				info.Enabled = *d.Enabled
 			}
 			if d.Id != nil {
 				info.ID = *d.Id
@@ -64,15 +66,16 @@ func (h *Handler) GetCloudFront(w http.ResponseWriter, r *http.Request) {
 					info.Aliases = append(info.Aliases, a)
 				}
 			}
-			if d.CacheBehaviors != nil {
-				info.CacheBehaviors = int(d.CacheBehaviors.Quantity)
+			if d.CacheBehaviors != nil && d.CacheBehaviors.Quantity != nil {
+				info.CacheBehaviors = int(*d.CacheBehaviors.Quantity)
 			}
 			if d.LastModifiedTime != nil {
 				info.LastModifiedTime = *d.LastModifiedTime
 			}
 			distributions = append(distributions, info)
 		}
-		if !out.DistributionList.IsTruncated {
+		isTruncated := out.DistributionList.IsTruncated != nil && *out.DistributionList.IsTruncated
+		if !isTruncated {
 			break
 		}
 		marker = out.DistributionList.NextMarker
