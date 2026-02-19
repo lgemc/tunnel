@@ -249,7 +249,6 @@ resource "aws_apigatewayv2_integration" "http_proxy" {
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.http_proxy.invoke_arn
   payload_format_version = "2.0"
-  invoke_mode            = "RESPONSE_STREAM"
 }
 
 resource "aws_apigatewayv2_route" "http_proxy" {

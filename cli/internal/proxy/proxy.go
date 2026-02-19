@@ -483,25 +483,51 @@ func (p *Proxy) streamProxyResponse(ctx context.Context, requestID string, resp 
 		return
 	}
 
-	// Stream body line by line
+	// Stream body as SSE events (data line + blank separator = one chunk) to halve DynamoDB writes.
+	// bufio.Scanner with ScanLines returns empty string for blank lines.
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 512*1024) // handle long SSE lines
 	chunkIndex := 0
+	var pending string // accumulates current SSE event lines
 	for scanner.Scan() {
 		line := scanner.Text()
+		if line == "" {
+			// Blank line = end of SSE event; send accumulated event as one chunk
+			if pending != "" {
+				chunkMsg := WebSocketMessage{
+					Action: "proxy_stream_chunk",
+					Data: map[string]interface{}{
+						"request_id":  requestID,
+						"chunk_index": chunkIndex,
+						"data":        pending + "\n",
+					},
+				}
+				if err := p.sendWebSocketMessage(chunkMsg); err != nil {
+					log.Printf("Failed to send proxy_stream_chunk %d for request %s: %v", chunkIndex, requestID, err)
+					return
+				}
+				chunkIndex++
+				pending = ""
+			}
+		} else {
+			pending += line + "\n"
+		}
+	}
+	// Flush any remaining data
+	if pending != "" {
 		chunkMsg := WebSocketMessage{
 			Action: "proxy_stream_chunk",
 			Data: map[string]interface{}{
 				"request_id":  requestID,
 				"chunk_index": chunkIndex,
-				"data":        line + "\n",
+				"data":        pending + "\n",
 			},
 		}
 		if err := p.sendWebSocketMessage(chunkMsg); err != nil {
 			log.Printf("Failed to send proxy_stream_chunk %d for request %s: %v", chunkIndex, requestID, err)
-			return
+		} else {
+			chunkIndex++
 		}
-		chunkIndex++
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("Error reading streaming body for request %s: %v", requestID, err)

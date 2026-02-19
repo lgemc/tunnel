@@ -30,16 +30,17 @@ resource "aws_cloudfront_distribution" "tunnel" {
 
   aliases = var.enable_cloudfront ? ["*.${var.domain_name}"] : []
 
+  # Lambda Function URL origin — used for tunnel proxy traffic with streaming support
   origin {
-    domain_name = replace(aws_apigatewayv2_api.rest_api.api_endpoint, "https://", "")
-    origin_id   = "rest-api-origin"
+    domain_name = trimsuffix(replace(aws_lambda_function_url.http_proxy.function_url, "https://", ""), "/")
+    origin_id   = "http-proxy-lambda-url"
 
     custom_origin_config {
       http_port                = 80
       https_port               = 443
       origin_protocol_policy   = "https-only"
       origin_ssl_protocols     = ["TLSv1.2"]
-      origin_read_timeout      = 60
+      origin_read_timeout      = 60 # CloudFront max; request quota increase for longer generations
       origin_keepalive_timeout = 60
     }
   }
@@ -47,7 +48,7 @@ resource "aws_cloudfront_distribution" "tunnel" {
   default_cache_behavior {
     allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
     cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "rest-api-origin"
+    target_origin_id = "http-proxy-lambda-url"
 
     cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # CachingDisabled
     origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # AllViewerExceptHostHeader
@@ -61,7 +62,7 @@ resource "aws_cloudfront_distribution" "tunnel" {
     min_ttl                = 0
     default_ttl            = 0
     max_ttl                = 0
-    compress               = true
+    compress               = false # Disable compression to allow SSE streaming pass-through
   }
 
   restrictions {

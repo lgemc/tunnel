@@ -388,3 +388,25 @@ data "archive_file" "http_proxy_placeholder" {
     filename = "bootstrap"
   }
 }
+
+# Lambda Function URL for http-proxy with response streaming enabled.
+# authorization_type = NONE lets CloudFront forward all viewer headers (including Authorization)
+# without stripping them for OAC signing — required for transparent proxy behaviour.
+resource "aws_lambda_function_url" "http_proxy" {
+  function_name      = aws_lambda_function.http_proxy.function_name
+  authorization_type = "NONE"
+  invoke_mode        = "RESPONSE_STREAM"
+}
+
+# Required since Oct 2025: new function URLs need both InvokeFunctionUrl AND InvokeFunction
+resource "aws_lambda_permission" "function_url_public_invoke" {
+  statement_id  = "FunctionURLAllowPublicInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.http_proxy.function_name
+  principal     = "*"
+}
+
+output "http_proxy_function_url" {
+  value       = aws_lambda_function_url.http_proxy.function_url
+  description = "Lambda Function URL for http-proxy (streaming)"
+}

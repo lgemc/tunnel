@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -84,18 +85,34 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 		}
 	}
 
-	// Extract subdomain from path parameters
+	// Extract subdomain — from path parameters (API Gateway) or raw path (Lambda Function URL)
 	subdomain := request.PathParameters["subdomain"]
+	proxyPath := ""
+	if subdomain == "" {
+		// Lambda Function URL: path looks like /t/{subdomain}/rest/of/path
+		trimmed := strings.TrimPrefix(request.RawPath, "/t/")
+		if trimmed == request.RawPath || trimmed == "" {
+			return errorResponse(400, "Subdomain is required")
+		}
+		slashIdx := strings.Index(trimmed, "/")
+		if slashIdx == -1 {
+			subdomain = trimmed
+			proxyPath = "/"
+		} else {
+			subdomain = trimmed[:slashIdx]
+			proxyPath = trimmed[slashIdx:]
+		}
+	} else {
+		// API Gateway: use path parameters
+		pp := request.PathParameters["proxy"]
+		if pp == "" {
+			proxyPath = "/"
+		} else {
+			proxyPath = "/" + pp
+		}
+	}
 	if subdomain == "" {
 		return errorResponse(400, "Subdomain is required")
-	}
-
-	// Get proxy path
-	proxyPath := request.PathParameters["proxy"]
-	if proxyPath == "" {
-		proxyPath = "/"
-	} else {
-		proxyPath = "/" + proxyPath
 	}
 	if request.RawQueryString != "" {
 		proxyPath = proxyPath + "?" + request.RawQueryString
@@ -319,7 +336,8 @@ func buildStreamingResponse(ctx context.Context, requestID string, firstItem map
 					continue
 				}
 
-				// Forward all newly available chunks
+				// Forward all newly available chunks and collect indices to clean up
+				var toDelete []int
 				for {
 					attrName := fmt.Sprintf("stream_chunk_%d", nextChunk)
 					av, ok := rawItem[attrName]
@@ -330,10 +348,32 @@ func buildStreamingResponse(ctx context.Context, requestID string, firstItem map
 						if _, err := pw.Write([]byte(sv.Value)); err != nil {
 							return
 						}
+						toDelete = append(toDelete, nextChunk)
 						nextChunk++
 					} else {
 						break
 					}
+				}
+
+				// Delete consumed chunks in one UpdateItem call to keep item size flat
+				if len(toDelete) > 0 {
+					removeExpr := "REMOVE "
+					exprNames := map[string]string{}
+					for i, idx := range toDelete {
+						alias := fmt.Sprintf("#c%d", i)
+						exprNames[alias] = fmt.Sprintf("stream_chunk_%d", idx)
+						if i > 0 {
+							removeExpr += ", "
+						}
+						removeExpr += alias
+					}
+					// Fire-and-forget; ignore errors (chunks will be TTL-deleted anyway)
+					_ = dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+						TableName:                aws.String(pendingRequestsTable),
+						Key:                      reqKey,
+						UpdateExpression:         aws.String(removeExpr),
+						ExpressionAttributeNames: exprNames,
+					})
 				}
 
 				// Stop when CLI signals end of stream
