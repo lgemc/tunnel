@@ -1,6 +1,6 @@
 .PHONY: help build-lambdas build-cli clean deploy test
 
-LAMBDA_FUNCTIONS := register-client create-tunnel delete-tunnel list-tunnels authorize-connection tunnel-connect tunnel-disconnect tunnel-proxy http-proxy
+LAMBDA_FUNCTIONS := register-client create-tunnel delete-tunnel list-tunnels authorize-connection tunnel-connect tunnel-disconnect tunnel-proxy http-proxy s3-upload-notify
 BUILD_DIR := build
 LAMBDA_DIR := lambdas
 CLI_DIR := cli

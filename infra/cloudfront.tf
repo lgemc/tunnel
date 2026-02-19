@@ -12,6 +12,12 @@ resource "aws_cloudfront_function" "tunnel_url_rewrite" {
       var host = request.headers.host.value;
       var subdomain = host.split('.')[0];
       var uri = request.uri;
+      // For upload-url and poll paths, inject the subdomain as a custom header
+      // so the Lambda can read it (CloudFront strips the original Host header).
+      if (uri.startsWith('/upload-url') || uri.startsWith('/poll/')) {
+        request.headers['x-tunnel-subdomain'] = { value: subdomain };
+        return request;
+      }
       if (uri === '/' || uri === '') {
         request.uri = '/t/' + subdomain;
       } else {

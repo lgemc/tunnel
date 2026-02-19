@@ -26,6 +26,7 @@ FUNCTIONS=(
     "tunnel-disconnect:tunnel-tunnel-disconnect-dev"
     "tunnel-proxy:tunnel-tunnel-proxy-dev"
     "http-proxy:tunnel-http-proxy-dev"
+    "s3-upload-notify:tunnel-s3-upload-notify-dev"
 )
 
 echo -e "${GREEN}Deploying Lambda functions to AWS${NC}"

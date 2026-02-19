@@ -420,7 +420,8 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	// This avoids the DynamoDB 400 KB item-size limit and the per-message chunking overhead.
 	if s3PutURL != "" && s3ResponseKey != "" &&
 		(len(respBody) > s3UploadThreshold || isBinaryContentType(resp.Header.Get("Content-Type"))) {
-		if err := p.uploadToS3(ctx, s3PutURL, resp.Header.Get("Content-Type"), respBody); err != nil {
+		// Always upload with application/octet-stream — the presigned URL is signed with that type.
+		if err := p.uploadToS3(ctx, s3PutURL, "application/octet-stream", respBody); err != nil {
 			log.Printf("Failed to upload response to S3 for request %s: %v — falling back to inline", requestID, err)
 			// Fall through to inline path on error
 		} else {

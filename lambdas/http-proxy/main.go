@@ -105,6 +105,14 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*even
 		return errorResponse(500, err.Error())
 	}
 
+	// DEBUG: log incoming request details
+	fmt.Printf("DEBUG path=%q rawPath=%q host=%q x-tunnel-subdomain=%q method=%q\n",
+		request.RawPath, request.RawPath,
+		request.Headers["host"],
+		request.Headers["x-tunnel-subdomain"],
+		request.RequestContext.HTTP.Method,
+	)
+
 	path := request.RawPath
 
 	// ── Poll endpoint: GET /poll/{request_id} ────────────────────────────────
@@ -307,16 +315,34 @@ func handleUploadURL(ctx context.Context, request events.APIGatewayV2HTTPRequest
 		return errorResponse(503, "Large upload support not configured (UPLOADS_BUCKET missing)")
 	}
 
-	// Parse subdomain from path: /upload-url/{subdomain}[/{proxy+}]
+	// Extract subdomain from path (/upload-url/{subdomain}/...) when present,
+	// or from the Host header when coming through CloudFront (*.tunnel.atelier.run).
+	// Dart client calls: POST myapp.tunnel.atelier.run/upload-url/transcribe
+	// → path = "/upload-url/transcribe", host = "myapp.tunnel.atelier.run"
 	trimmed := strings.TrimPrefix(request.RawPath, "/upload-url/")
-	if trimmed == "" {
-		return errorResponse(400, "Subdomain is required")
-	}
-	subdomain := trimmed
+	subdomain := ""
 	proxyPath := "/"
-	if idx := strings.Index(trimmed, "/"); idx != -1 {
-		subdomain = trimmed[:idx]
-		proxyPath = trimmed[idx:]
+
+	if trimmed != "" {
+		// CloudFront injects x-tunnel-subdomain header (original Host is stripped by CloudFront).
+		// Fall back to parsing it from the path for direct Lambda URL calls.
+		cfSubdomain := request.Headers["x-tunnel-subdomain"]
+		if cfSubdomain != "" {
+			subdomain = cfSubdomain
+			proxyPath = "/" + trimmed
+		} else {
+			// Direct path: /upload-url/{subdomain}/{proxy+}
+			if idx := strings.Index(trimmed, "/"); idx != -1 {
+				subdomain = trimmed[:idx]
+				proxyPath = trimmed[idx:]
+			} else {
+				subdomain = trimmed
+			}
+		}
+	}
+
+	if subdomain == "" {
+		return errorResponse(400, "Subdomain is required")
 	}
 
 	// Parse optional metadata from body (method, content-type, headers)
@@ -374,17 +400,12 @@ func handleUploadURL(ctx context.Context, request events.APIGatewayV2HTTPRequest
 	}
 
 	// Build the presigned PUT URL for the request body (what the caller uses to upload)
+	// No Tagging — it would be included as a signed header the client must send.
+	// The request_id is already encoded in the S3 key path.
 	putInput := &s3.PutObjectInput{
-		Bucket: aws.String(uploadsBucket),
-		Key:    aws.String(s3RequestKey),
-		// Store tunnel + request metadata as S3 object tags so the notify Lambda can recover them
-		Tagging: aws.String(fmt.Sprintf(
-			"request_id=%s&tunnel_id=%s&method=%s&subdomain=%s",
-			requestID, domain.TunnelID, meta.Method, subdomain,
-		)),
-	}
-	if meta.ContentType != "" {
-		putInput.ContentType = aws.String(meta.ContentType)
+		Bucket:      aws.String(uploadsBucket),
+		Key:         aws.String(s3RequestKey),
+		ContentType: aws.String("application/octet-stream"),
 	}
 	presignReq, err := s3PresignClient.PresignPutObject(ctx, putInput,
 		s3.WithPresignExpires(30*time.Minute),
