@@ -64,6 +64,12 @@ func handler(ctx context.Context, request events.APIGatewayWebsocketProxyRequest
 		return handleProxyResponse(ctx, message)
 	case "proxy_response_chunk":
 		return handleProxyResponseChunk(ctx, message)
+	case "proxy_stream_start":
+		return handleProxyStreamStart(ctx, message)
+	case "proxy_stream_chunk":
+		return handleProxyStreamChunk(ctx, message)
+	case "proxy_stream_end":
+		return handleProxyStreamEnd(ctx, message)
 	default:
 		return errorResponse(400, fmt.Sprintf("Unknown message action: %s", message.Action))
 	}
@@ -240,6 +246,104 @@ func handleProxyResponse(ctx context.Context, message models.WebSocketMessage) (
 		StatusCode: 200,
 		Body:       `{"message": "Proxy response processed"}`,
 	}, nil
+}
+
+// handleProxyStreamStart marks a pending request as streaming and stores status/headers.
+func handleProxyStreamStart(ctx context.Context, message models.WebSocketMessage) (events.APIGatewayProxyResponse, error) {
+	requestID, _ := message.Data["request_id"].(string)
+	if requestID == "" {
+		return errorResponse(400, "Request ID is required")
+	}
+
+	statusCode := 200
+	if sc, ok := message.Data["status_code"].(float64); ok {
+		statusCode = int(sc)
+	}
+
+	headersAV := map[string]types.AttributeValue{}
+	if headers, ok := message.Data["response_headers"].(map[string]interface{}); ok {
+		for k, v := range headers {
+			if strVal, ok := v.(string); ok {
+				headersAV[k] = &types.AttributeValueMemberS{Value: strVal}
+			}
+		}
+	}
+
+	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(pendingRequestsTable),
+		Key: map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		},
+		UpdateExpression: aws.String("SET is_streaming = :t, stream_status = :code, stream_headers = :headers, stream_chunk_count = :zero"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":t":       &types.AttributeValueMemberBOOL{Value: true},
+			":code":    &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", statusCode)},
+			":headers": &types.AttributeValueMemberM{Value: headersAV},
+			":zero":    &types.AttributeValueMemberN{Value: "0"},
+		},
+	})
+	if err != nil {
+		log.Printf("proxy_stream_start: failed for request_id=%s: %v", requestID, err)
+		return errorResponse(500, fmt.Sprintf("Failed to mark stream start: %v", err))
+	}
+	log.Printf("proxy_stream_start: request_id=%s status=%d", requestID, statusCode)
+	return events.APIGatewayProxyResponse{StatusCode: 200, Body: `{"message":"stream started"}`}, nil
+}
+
+// handleProxyStreamChunk stores a single SSE line chunk in DynamoDB.
+func handleProxyStreamChunk(ctx context.Context, message models.WebSocketMessage) (events.APIGatewayProxyResponse, error) {
+	requestID, _ := message.Data["request_id"].(string)
+	if requestID == "" {
+		return errorResponse(400, "Request ID is required")
+	}
+
+	chunkIndexF, _ := message.Data["chunk_index"].(float64)
+	chunkIndex := int(chunkIndexF)
+	data, _ := message.Data["data"].(string)
+
+	attrName := fmt.Sprintf("stream_chunk_%d", chunkIndex)
+	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(pendingRequestsTable),
+		Key: map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		},
+		UpdateExpression:         aws.String("SET #chunk = :data, stream_chunk_count = :count"),
+		ExpressionAttributeNames: map[string]string{"#chunk": attrName},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":data":  &types.AttributeValueMemberS{Value: data},
+			":count": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", chunkIndex+1)},
+		},
+	})
+	if err != nil {
+		log.Printf("proxy_stream_chunk: failed to store chunk %d for request_id=%s: %v", chunkIndex, requestID, err)
+		return errorResponse(500, fmt.Sprintf("Failed to store stream chunk: %v", err))
+	}
+	return events.APIGatewayProxyResponse{StatusCode: 200, Body: `{"message":"chunk stored"}`}, nil
+}
+
+// handleProxyStreamEnd marks a streaming request as done.
+func handleProxyStreamEnd(ctx context.Context, message models.WebSocketMessage) (events.APIGatewayProxyResponse, error) {
+	requestID, _ := message.Data["request_id"].(string)
+	if requestID == "" {
+		return errorResponse(400, "Request ID is required")
+	}
+
+	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(pendingRequestsTable),
+		Key: map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		},
+		UpdateExpression: aws.String("SET stream_done = :t"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":t": &types.AttributeValueMemberBOOL{Value: true},
+		},
+	})
+	if err != nil {
+		log.Printf("proxy_stream_end: failed for request_id=%s: %v", requestID, err)
+		return errorResponse(500, fmt.Sprintf("Failed to mark stream end: %v", err))
+	}
+	log.Printf("proxy_stream_end: stream complete for request_id=%s", requestID)
+	return events.APIGatewayProxyResponse{StatusCode: 200, Body: `{"message":"stream ended"}`}, nil
 }
 
 // handleHTTPRequest would be called when an external HTTP request comes in

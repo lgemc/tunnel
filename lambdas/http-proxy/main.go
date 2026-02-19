@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -71,7 +74,7 @@ func generateRequestID() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*events.LambdaFunctionURLStreamingResponse, error) {
 	// Initialize DB client if not already done
 	if dbClient == nil {
 		var err error
@@ -235,55 +238,166 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		return errorResponse(500, fmt.Sprintf("Failed to send request to tunnel: %v", err))
 	}
 
-	// Poll for response (timeout after 3 minutes)
-	timeout := time.After(180 * time.Second)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	// Poll for response — detect streaming or buffered completion (50ms interval, 3min timeout)
+	pollTimeout := time.After(180 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+
+	reqKey := map[string]types.AttributeValue{
+		"request_id": &types.AttributeValueMemberS{Value: requestID},
+	}
 
 	for {
 		select {
-		case <-timeout:
+		case <-pollTimeout:
 			return errorResponse(504, "Gateway timeout - no response from tunnel")
 		case <-ticker.C:
-			// Check if response is available
-			reqKey := map[string]types.AttributeValue{
-				"request_id": &types.AttributeValueMemberS{Value: requestID},
-			}
-
-			var updatedReq PendingRequest
-			err := dbClient.GetItem(ctx, pendingRequestsTable, reqKey, &updatedReq)
+			rawItem, err := dbClient.GetRawItem(ctx, pendingRequestsTable, reqKey)
 			if err != nil {
-				continue // Keep polling
+				continue
 			}
 
-			if updatedReq.Status == "completed" {
-				// Return the response
-				statusCode := updatedReq.ResponseStatus
-				if statusCode == 0 {
-					statusCode = 200
+			// SSE / streaming response detected
+			if isStreamingAV, ok := rawItem["is_streaming"]; ok {
+				if bv, ok := isStreamingAV.(*types.AttributeValueMemberBOOL); ok && bv.Value {
+					return buildStreamingResponse(ctx, requestID, rawItem)
 				}
+			}
 
-				return events.APIGatewayV2HTTPResponse{
-					StatusCode: statusCode,
-					Headers:    updatedReq.ResponseHeaders,
-					Body:       updatedReq.ResponseBody,
-				}, nil
+			// Buffered (non-streaming) response completed
+			if statusAV, ok := rawItem["status"]; ok {
+				if sv, ok := statusAV.(*types.AttributeValueMemberS); ok && sv.Value == "completed" {
+					return buildBufferedResponse(rawItem)
+				}
 			}
 		}
 	}
 }
 
-func errorResponse(statusCode int, message string) (events.APIGatewayV2HTTPResponse, error) {
+// buildStreamingResponse creates a pipe-backed streaming response that forwards
+// SSE chunks from DynamoDB to the HTTP caller as they arrive.
+func buildStreamingResponse(ctx context.Context, requestID string, firstItem map[string]types.AttributeValue) (*events.LambdaFunctionURLStreamingResponse, error) {
+	statusCode := 200
+	if sc, ok := firstItem["stream_status"]; ok {
+		if nv, ok := sc.(*types.AttributeValueMemberN); ok {
+			statusCode, _ = strconv.Atoi(nv.Value)
+		}
+	}
+
+	headers := map[string]string{}
+	if h, ok := firstItem["stream_headers"]; ok {
+		if mv, ok := h.(*types.AttributeValueMemberM); ok {
+			for k, v := range mv.Value {
+				if sv, ok := v.(*types.AttributeValueMemberS); ok {
+					headers[k] = sv.Value
+				}
+			}
+		}
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		defer pw.Close()
+
+		streamTimeout := time.After(180 * time.Second)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		nextChunk := 0
+		reqKey := map[string]types.AttributeValue{
+			"request_id": &types.AttributeValueMemberS{Value: requestID},
+		}
+
+		for {
+			select {
+			case <-streamTimeout:
+				return
+			case <-ticker.C:
+				rawItem, err := dbClient.GetRawItem(ctx, pendingRequestsTable, reqKey)
+				if err != nil {
+					continue
+				}
+
+				// Forward all newly available chunks
+				for {
+					attrName := fmt.Sprintf("stream_chunk_%d", nextChunk)
+					av, ok := rawItem[attrName]
+					if !ok {
+						break
+					}
+					if sv, ok := av.(*types.AttributeValueMemberS); ok {
+						if _, err := pw.Write([]byte(sv.Value)); err != nil {
+							return
+						}
+						nextChunk++
+					} else {
+						break
+					}
+				}
+
+				// Stop when CLI signals end of stream
+				if doneAV, ok := rawItem["stream_done"]; ok {
+					if bv, ok := doneAV.(*types.AttributeValueMemberBOOL); ok && bv.Value {
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return &events.LambdaFunctionURLStreamingResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       pr,
+	}, nil
+}
+
+// buildBufferedResponse returns the full body at once for non-streaming responses.
+func buildBufferedResponse(rawItem map[string]types.AttributeValue) (*events.LambdaFunctionURLStreamingResponse, error) {
+	statusCode := 200
+	if sc, ok := rawItem["response_status"]; ok {
+		if nv, ok := sc.(*types.AttributeValueMemberN); ok {
+			statusCode, _ = strconv.Atoi(nv.Value)
+		}
+	}
+
+	headers := map[string]string{}
+	if h, ok := rawItem["response_headers"]; ok {
+		if mv, ok := h.(*types.AttributeValueMemberM); ok {
+			for k, v := range mv.Value {
+				if sv, ok := v.(*types.AttributeValueMemberS); ok {
+					headers[k] = sv.Value
+				}
+			}
+		}
+	}
+
+	responseBody := ""
+	if bodyAV, ok := rawItem["response_body"]; ok {
+		if sv, ok := bodyAV.(*types.AttributeValueMemberS); ok {
+			responseBody = sv.Value
+		}
+	}
+
+	return &events.LambdaFunctionURLStreamingResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       bytes.NewReader([]byte(responseBody)),
+	}, nil
+}
+
+func errorResponse(statusCode int, message string) (*events.LambdaFunctionURLStreamingResponse, error) {
 	body, _ := json.Marshal(map[string]string{
 		"error": message,
 	})
 
-	return events.APIGatewayV2HTTPResponse{
+	return &events.LambdaFunctionURLStreamingResponse{
 		StatusCode: statusCode,
 		Headers: map[string]string{
 			"Content-Type": "application/json",
 		},
-		Body: string(body),
+		Body: bytes.NewReader(body),
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -355,6 +356,14 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 		p.sendProxyErrorResponse(requestID, fmt.Sprintf("Failed to make request: %v", err))
 		return
 	}
+
+	// Detect SSE / streaming responses and handle progressively
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		log.Printf("Detected SSE streaming response for request %s, forwarding progressively", requestID)
+		p.streamProxyResponse(ctx, requestID, resp)
+		return
+	}
+
 	defer resp.Body.Close()
 
 	// Read response body
@@ -375,13 +384,31 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 
 	bodyStr := string(respBody)
 
-	// If body exceeds WebSocket message limit, send in chunks first
-	if len(bodyStr) > chunkSize {
-		totalChunks := (len(bodyStr) + chunkSize - 1) / chunkSize
-		log.Printf("Response body too large (%d bytes), sending in %d chunks for request %s", len(bodyStr), totalChunks, requestID)
+	// Check total serialized message size (body + JSON wrapper + headers) against the 128KB limit
+	testMsg := WebSocketMessage{
+		Action: "proxy_response",
+		Data: map[string]interface{}{
+			"request_id":       requestID,
+			"status_code":      resp.StatusCode,
+			"response_headers": responseHeaders,
+			"response_body":    bodyStr,
+		},
+	}
+	testBytes, _ := json.Marshal(testMsg)
+
+	// If total message exceeds WebSocket message limit, send body in chunks
+	if len(testBytes) > 128*1024 {
+		// Calculate effective chunk size accounting for non-body overhead
+		overhead := len(testBytes) - len(bodyStr)
+		effectiveChunkSize := 120*1024 - overhead
+		if effectiveChunkSize <= 0 || effectiveChunkSize > chunkSize {
+			effectiveChunkSize = chunkSize
+		}
+		totalChunks := (len(bodyStr) + effectiveChunkSize - 1) / effectiveChunkSize
+		log.Printf("Response too large (%d bytes total), sending body in %d chunks for request %s", len(testBytes), totalChunks, requestID)
 		for i := 0; i < totalChunks; i++ {
-			start := i * chunkSize
-			end := start + chunkSize
+			start := i * effectiveChunkSize
+			end := start + effectiveChunkSize
 			if end > len(bodyStr) {
 				end = len(bodyStr)
 			}
@@ -418,21 +445,78 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 		return
 	}
 
-	// Send response back through WebSocket
-	responseMessage := WebSocketMessage{
-		Action: "proxy_response",
+	// Send response back through WebSocket (reuse already-marshaled testBytes)
+	p.writeMux.Lock()
+	err = p.conn.WriteMessage(websocket.TextMessage, testBytes)
+	p.writeMux.Unlock()
+	if err != nil {
+		log.Printf("Failed to send proxy response: %v", err)
+	} else {
+		log.Printf("Sent proxy response for request %s (status: %d)", requestID, resp.StatusCode)
+	}
+}
+
+// streamProxyResponse handles SSE / chunked responses by forwarding each line progressively
+// via WebSocket using proxy_stream_start, proxy_stream_chunk, and proxy_stream_end messages.
+func (p *Proxy) streamProxyResponse(ctx context.Context, requestID string, resp *http.Response) {
+	defer resp.Body.Close()
+
+	// Build flat response headers map
+	responseHeaders := make(map[string]string)
+	for k, v := range resp.Header {
+		if len(v) > 0 {
+			responseHeaders[k] = v[0]
+		}
+	}
+
+	// Signal stream start (carries status code + headers)
+	startMsg := WebSocketMessage{
+		Action: "proxy_stream_start",
 		Data: map[string]interface{}{
 			"request_id":       requestID,
 			"status_code":      resp.StatusCode,
 			"response_headers": responseHeaders,
-			"response_body":    bodyStr,
 		},
 	}
+	if err := p.sendWebSocketMessage(startMsg); err != nil {
+		log.Printf("Failed to send proxy_stream_start for request %s: %v", requestID, err)
+		return
+	}
 
-	if err := p.sendWebSocketMessage(responseMessage); err != nil {
-		log.Printf("Failed to send proxy response: %v", err)
-	} else {
-		log.Printf("Sent proxy response for request %s (status: %d)", requestID, resp.StatusCode)
+	// Stream body line by line
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 512*1024) // handle long SSE lines
+	chunkIndex := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		chunkMsg := WebSocketMessage{
+			Action: "proxy_stream_chunk",
+			Data: map[string]interface{}{
+				"request_id":  requestID,
+				"chunk_index": chunkIndex,
+				"data":        line + "\n",
+			},
+		}
+		if err := p.sendWebSocketMessage(chunkMsg); err != nil {
+			log.Printf("Failed to send proxy_stream_chunk %d for request %s: %v", chunkIndex, requestID, err)
+			return
+		}
+		chunkIndex++
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error reading streaming body for request %s: %v", requestID, err)
+	}
+	log.Printf("Streamed %d chunks for request %s", chunkIndex, requestID)
+
+	// Signal end of stream
+	endMsg := WebSocketMessage{
+		Action: "proxy_stream_end",
+		Data: map[string]interface{}{
+			"request_id": requestID,
+		},
+	}
+	if err := p.sendWebSocketMessage(endMsg); err != nil {
+		log.Printf("Failed to send proxy_stream_end for request %s: %v", requestID, err)
 	}
 }
 
