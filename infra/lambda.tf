@@ -213,7 +213,7 @@ resource "aws_lambda_function" "http_proxy" {
   role          = aws_iam_role.lambda_execution.arn
   handler       = "bootstrap"
   runtime       = "provided.al2023"
-  timeout       = 30
+  timeout       = 180
   memory_size   = var.lambda_memory_size
 
   filename         = data.archive_file.http_proxy_placeholder.output_path

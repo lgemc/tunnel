@@ -164,23 +164,6 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 		return errorResponse(500, fmt.Sprintf("Failed to store request: %v", err))
 	}
 
-	// Send request to WebSocket connection
-	proxyReq := ProxyRequest{
-		RequestID: requestID,
-		Method:    request.RequestContext.HTTP.Method,
-		Path:      proxyPath,
-		Headers:   request.Headers,
-		Body:      body,
-	}
-
-	payloadBytes, err := json.Marshal(map[string]interface{}{
-		"action": "proxy",
-		"data":   proxyReq,
-	})
-	if err != nil {
-		return errorResponse(500, "Failed to marshal request")
-	}
-
 	// Send request through WebSocket
 	cfg, err := dbClient.GetAWSConfig(ctx)
 	if err != nil {
@@ -190,6 +173,59 @@ func handler(ctx context.Context, request events.APIGatewayV2HTTPRequest) (event
 	apigwClient := apigatewaymanagementapi.NewFromConfig(cfg, func(o *apigatewaymanagementapi.Options) {
 		o.BaseEndpoint = aws.String(websocketEndpoint)
 	})
+
+	const wsChunkSize = 90 * 1024 // 90KB — stays under API Gateway's 128KB WebSocket message limit
+
+	// If body is large, send it in chunks before the main proxy message
+	totalChunks := 0
+	proxyBody := body
+	if len(body) > wsChunkSize {
+		totalChunks = (len(body) + wsChunkSize - 1) / wsChunkSize
+		for i := 0; i < totalChunks; i++ {
+			start := i * wsChunkSize
+			end := start + wsChunkSize
+			if end > len(body) {
+				end = len(body)
+			}
+			chunkPayload, err := json.Marshal(map[string]interface{}{
+				"action": "proxy_chunk",
+				"data": map[string]interface{}{
+					"request_id":  requestID,
+					"chunk_index": i,
+					"data":        body[start:end],
+				},
+			})
+			if err != nil {
+				return errorResponse(500, "Failed to marshal request chunk")
+			}
+			_, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
+				ConnectionId: aws.String(tunnel.ConnectionID),
+				Data:         chunkPayload,
+			})
+			if err != nil {
+				return errorResponse(500, fmt.Sprintf("Failed to send request chunk to tunnel: %v", err))
+			}
+		}
+		proxyBody = "" // body will be assembled by CLI from chunks
+	}
+
+	// Send request to WebSocket connection
+	proxyReq := map[string]interface{}{
+		"request_id":   requestID,
+		"method":       request.RequestContext.HTTP.Method,
+		"path":         proxyPath,
+		"headers":      request.Headers,
+		"body":         proxyBody,
+		"total_chunks": totalChunks,
+	}
+
+	payloadBytes, err := json.Marshal(map[string]interface{}{
+		"action": "proxy",
+		"data":   proxyReq,
+	})
+	if err != nil {
+		return errorResponse(500, "Failed to marshal request")
+	}
 
 	_, err = apigwClient.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
 		ConnectionId: aws.String(tunnel.ConnectionID),

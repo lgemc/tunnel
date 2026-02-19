@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,8 @@ type Proxy struct {
 	pendingReqs    map[string]chan *HTTPResponse
 	pendingReqsMux sync.RWMutex
 	writeMux       sync.Mutex
+	chunkBuffers   map[string]map[int]string
+	chunkMux       sync.Mutex
 	stopCh         chan struct{}
 }
 
@@ -61,6 +64,7 @@ func NewProxy(localPort int, websocketURL, apiKey, tunnelID string) *Proxy {
 		APIKey:       apiKey,
 		TunnelID:     tunnelID,
 		pendingReqs:  make(map[string]chan *HTTPResponse),
+		chunkBuffers: make(map[string]map[int]string),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -148,6 +152,8 @@ func (p *Proxy) handleWebSocketMessages(ctx context.Context) {
 				go p.handleHTTPRequest(ctx, message)
 			case "proxy":
 				go p.handleProxyRequest(ctx, message)
+			case "proxy_chunk":
+				p.handleProxyChunk(message)
 			case "PONG":
 				// Keep-alive response, no action needed
 			default:
@@ -265,6 +271,20 @@ func (p *Proxy) sendWebSocketMessage(message WebSocketMessage) error {
 	return p.conn.WriteMessage(websocket.TextMessage, messageBytes)
 }
 
+// handleProxyChunk stores an incoming request body chunk
+func (p *Proxy) handleProxyChunk(message WebSocketMessage) {
+	requestID, _ := message.Data["request_id"].(string)
+	chunkIndexF, _ := message.Data["chunk_index"].(float64)
+	data, _ := message.Data["data"].(string)
+
+	p.chunkMux.Lock()
+	defer p.chunkMux.Unlock()
+	if p.chunkBuffers[requestID] == nil {
+		p.chunkBuffers[requestID] = make(map[int]string)
+	}
+	p.chunkBuffers[requestID][int(chunkIndexF)] = data
+}
+
 // handleProxyRequest handles an incoming proxy request from the HTTP proxy Lambda
 func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage) {
 	// Extract request details from message.Data
@@ -283,6 +303,21 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	method, _ := dataMap["method"].(string)
 	path, _ := dataMap["path"].(string)
 	body, _ := dataMap["body"].(string)
+
+	// If body was chunked, assemble it from buffered chunks
+	if totalChunksF, ok := dataMap["total_chunks"].(float64); ok && totalChunksF > 0 {
+		totalChunks := int(totalChunksF)
+		p.chunkMux.Lock()
+		chunks := p.chunkBuffers[requestID]
+		delete(p.chunkBuffers, requestID)
+		p.chunkMux.Unlock()
+		var buf strings.Builder
+		for i := 0; i < totalChunks; i++ {
+			buf.WriteString(chunks[i])
+		}
+		body = buf.String()
+		log.Printf("Assembled %d chunks (%d bytes) for request %s", totalChunks, len(body), requestID)
+	}
 
 	log.Printf("Handling proxy request: %s %s (ID: %s)", method, path, requestID)
 

@@ -4,6 +4,9 @@ LAMBDA_FUNCTIONS := register-client create-tunnel delete-tunnel list-tunnels aut
 BUILD_DIR := build
 LAMBDA_DIR := lambdas
 CLI_DIR := cli
+BACKOFFICE_API_DIR := backoffice/api
+BACKOFFICE_FRONTEND_DIR := backoffice/frontend
+BACKOFFICE_INFRA_DIR := infra/backoffice
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -115,5 +118,54 @@ lint: ## Lint Go code
 	@cd $(LAMBDA_DIR) && golangci-lint run ./...
 	@cd $(CLI_DIR) && golangci-lint run ./...
 	@echo "✓ Code linted!"
+
+## ── Backoffice ────────────────────────────────────────────────────────────────
+
+build-backoffice-api: ## Build the backoffice API Lambda
+	@echo "Building backoffice API Lambda..."
+	@mkdir -p $(BUILD_DIR)/lambdas
+	@cd $(BACKOFFICE_API_DIR) && \
+		GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap main.go && \
+		zip -j ../../$(BUILD_DIR)/lambdas/backoffice-api.zip bootstrap && \
+		rm bootstrap
+	@echo "✓ Backoffice API Lambda built: $(BUILD_DIR)/lambdas/backoffice-api.zip"
+
+build-backoffice-frontend: ## Build the backoffice React frontend
+	@echo "Building backoffice frontend..."
+	@cd $(BACKOFFICE_FRONTEND_DIR) && npm install && npm run build
+	@echo "✓ Backoffice frontend built: $(BACKOFFICE_FRONTEND_DIR)/dist"
+
+build-backoffice: build-backoffice-api build-backoffice-frontend ## Build both backoffice API and frontend
+
+deploy-backoffice-init: ## Initialize OpenTofu for backoffice infra
+	@echo "Initializing backoffice OpenTofu..."
+	@cd $(BACKOFFICE_INFRA_DIR) && tofu init
+
+deploy-backoffice-plan: ## Plan backoffice OpenTofu deployment
+	@cd $(BACKOFFICE_INFRA_DIR) && tofu plan
+
+deploy-backoffice-apply: build-backoffice ## Apply backoffice infra + deploy code
+	@cd $(BACKOFFICE_INFRA_DIR) && tofu apply
+	@$(MAKE) update-backoffice
+
+update-backoffice: build-backoffice-api ## Fast-update: rebuild API Lambda + push to S3 + invalidate CDN
+	@echo "Updating backoffice Lambda..."
+	@FUNC=$$(cd $(BACKOFFICE_INFRA_DIR) && tofu output -raw backoffice_lambda_name 2>/dev/null) && \
+		aws lambda update-function-code \
+			--function-name "$$FUNC" \
+			--zip-file fileb://$(BUILD_DIR)/lambdas/backoffice-api.zip \
+			--no-cli-pager && \
+		echo "✓ Lambda updated: $$FUNC"
+	@echo "Syncing frontend to S3..."
+	@BUCKET=$$(cd $(BACKOFFICE_INFRA_DIR) && tofu output -raw frontend_s3_bucket 2>/dev/null) && \
+		aws s3 sync $(BACKOFFICE_FRONTEND_DIR)/dist s3://$$BUCKET --delete && \
+		echo "✓ Frontend synced to s3://$$BUCKET"
+	@echo "Invalidating CloudFront cache..."
+	@DIST_ID=$$(cd $(BACKOFFICE_INFRA_DIR) && tofu output -raw cloudfront_distribution_id 2>/dev/null) && \
+		aws cloudfront create-invalidation --distribution-id "$$DIST_ID" --paths "/*" --no-cli-pager && \
+		echo "✓ CloudFront cache invalidated"
+
+deploy-backoffice-destroy: ## Destroy backoffice infrastructure
+	@cd $(BACKOFFICE_INFRA_DIR) && tofu destroy
 
 .DEFAULT_GOAL := help
