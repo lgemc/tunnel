@@ -138,6 +138,9 @@ func handleProxyResponseChunk(ctx context.Context, message models.WebSocketMessa
 	chunkIndex := int(chunkIndexF)
 	data, _ := message.Data["data"].(string)
 
+	// Each chunk is stored on the request's own DynamoDB item (keyed by request_id),
+	// so attribute names only need to be unique within that item — chunk_0, chunk_1, etc.
+	// No cross-request collision is possible because each request has its own item.
 	attrName := fmt.Sprintf("chunk_%d", chunkIndex)
 	err := dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(pendingRequestsTable),

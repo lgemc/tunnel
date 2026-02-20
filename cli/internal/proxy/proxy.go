@@ -20,8 +20,9 @@ import (
 const chunkSize = 90 * 1024 // 90KB — stays under API Gateway's 128KB WebSocket message limit
 
 // s3UploadThreshold is the response body size above which the CLI stages the
-// response in S3 instead of sending it through DynamoDB (400 KB item limit).
-const s3UploadThreshold = 256 * 1024 // 256 KB
+// response in S3 instead of sending it inline via WebSocket chunks.
+// Set below the 90 KB WebSocket chunk size so any multi-chunk response goes via S3.
+const s3UploadThreshold = 80 * 1024 // 80 KB
 
 // isBinaryContentType reports whether ct is a binary media type that should
 // be staged through S3 rather than DynamoDB regardless of size.
