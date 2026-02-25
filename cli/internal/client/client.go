@@ -203,3 +203,24 @@ func (c *Client) DeleteTunnel(tunnelID string) error {
 
 	return nil
 }
+
+// TestTunnel tests if a tunnel is working by making a health check request
+func (c *Client) TestTunnel(domain string) error {
+	// Make a simple GET request to the tunnel's public URL
+	url := fmt.Sprintf("https://%s/__tunnel_health", domain)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create test request: %w", err)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("tunnel is not responding: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Any response (even errors) means the tunnel is forwarding traffic
+	// The local service might not have a /__tunnel_health endpoint, so we consider any response as success
+	return nil
+}

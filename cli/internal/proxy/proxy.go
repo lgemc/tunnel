@@ -49,6 +49,8 @@ type Proxy struct {
 	chunkBuffers   map[string]map[int]string
 	chunkMux       sync.Mutex
 	stopCh         chan struct{}
+	AutoReconnect  bool
+	reconnectMux   sync.Mutex
 }
 
 // WebSocketMessage represents a message sent over the WebSocket connection
@@ -89,7 +91,12 @@ func NewProxy(localPort int, websocketURL, apiKey, tunnelID string) *Proxy {
 
 // Start starts the proxy
 func (p *Proxy) Start(ctx context.Context) error {
-	// Connect to WebSocket
+	// Connect to WebSocket with retry logic if AutoReconnect is enabled
+	if p.AutoReconnect {
+		return p.startWithReconnect(ctx)
+	}
+
+	// Original behavior: single connection attempt
 	if err := p.connectWebSocket(ctx); err != nil {
 		return fmt.Errorf("failed to connect to WebSocket: %w", err)
 	}
@@ -112,6 +119,149 @@ func (p *Proxy) Start(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+// startWithReconnect starts the proxy with automatic reconnection on failure
+func (p *Proxy) startWithReconnect(ctx context.Context) error {
+	reconnectCh := make(chan struct{}, 1)
+
+	// Initial connection
+	if err := p.connectAndRun(ctx, reconnectCh); err != nil && err != context.Canceled {
+		log.Printf("Initial connection failed: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Cleanup
+			close(p.stopCh)
+			if p.conn != nil {
+				p.conn.Close()
+			}
+			return ctx.Err()
+		case <-reconnectCh:
+			// Reconnect with exponential backoff
+			log.Printf("Connection lost, attempting to reconnect...")
+			if err := p.reconnectWithBackoff(ctx); err != nil {
+				if err == context.Canceled {
+					return err
+				}
+				log.Printf("Failed to reconnect: %v", err)
+				continue
+			}
+			// Successfully reconnected, start handling messages again
+			go p.handleWebSocketMessages(ctx)
+			go p.keepAlive(ctx)
+		}
+	}
+}
+
+// connectAndRun establishes connection and starts message handlers
+func (p *Proxy) connectAndRun(ctx context.Context, reconnectCh chan struct{}) error {
+	if err := p.connectWebSocket(ctx); err != nil {
+		// Trigger reconnect
+		select {
+		case reconnectCh <- struct{}{}:
+		default:
+		}
+		return fmt.Errorf("failed to connect to WebSocket: %w", err)
+	}
+
+	// Start WebSocket message handler
+	go p.handleWebSocketMessagesWithReconnect(ctx, reconnectCh)
+
+	// Start ping/keep-alive loop
+	go p.keepAlive(ctx)
+
+	log.Printf("Proxy connected successfully")
+	return nil
+}
+
+// reconnectWithBackoff attempts to reconnect with exponential backoff
+func (p *Proxy) reconnectWithBackoff(ctx context.Context) error {
+	p.reconnectMux.Lock()
+	defer p.reconnectMux.Unlock()
+
+	maxRetries := 10
+	baseDelay := 1 * time.Second
+	maxDelay := 30 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		select {
+		case <-ctx.Done():
+			return context.Canceled
+		default:
+		}
+
+		// Close existing connection if any
+		if p.conn != nil {
+			p.conn.Close()
+		}
+
+		// Attempt to connect
+		if err := p.connectWebSocket(ctx); err != nil {
+			delay := baseDelay * time.Duration(1<<uint(i))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			log.Printf("Reconnection attempt %d/%d failed: %v (retrying in %v)", i+1, maxRetries, err, delay)
+
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				return context.Canceled
+			}
+		} else {
+			log.Printf("Successfully reconnected!")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to reconnect after %d attempts", maxRetries)
+}
+
+// handleWebSocketMessagesWithReconnect handles incoming messages and triggers reconnect on error
+func (p *Proxy) handleWebSocketMessagesWithReconnect(ctx context.Context, reconnectCh chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		default:
+			_, messageBytes, err := p.conn.ReadMessage()
+			if err != nil {
+				log.Printf("Error reading WebSocket message: %v", err)
+				// Trigger reconnect
+				select {
+				case reconnectCh <- struct{}{}:
+				default:
+				}
+				return
+			}
+
+			var message WebSocketMessage
+			if err := json.Unmarshal(messageBytes, &message); err != nil {
+				log.Printf("Error unmarshaling message: %v", err)
+				continue
+			}
+
+			// Handle different message types
+			switch message.Action {
+			case "REQUEST":
+				go p.handleHTTPRequest(ctx, message)
+			case "proxy":
+				go p.handleProxyRequest(ctx, message)
+			case "proxy_chunk":
+				p.handleProxyChunk(message)
+			case "PONG":
+				// Keep-alive response, no action needed
+			default:
+				log.Printf("Unknown message action: %s", message.Action)
+			}
+		}
+	}
 }
 
 // connectWebSocket establishes a WebSocket connection

@@ -27,11 +27,15 @@ Examples:
 	RunE: runStart,
 }
 
-var subdomain string
+var (
+	subdomain     string
+	autoReconnect bool
+)
 
 func init() {
 	rootCmd.AddCommand(startCmd)
 	startCmd.Flags().StringVar(&subdomain, "domain", "", "Custom subdomain (optional)")
+	startCmd.Flags().BoolVar(&autoReconnect, "auto-reconnect", true, "Automatically reconnect on connection failure (default: true)")
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
@@ -84,6 +88,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	fmt.Println("Starting proxy...")
 
 	proxyInstance := proxy.NewProxy(port, tunnel.WebsocketURL, cfg.APIKey, tunnel.TunnelID)
+	proxyInstance.AutoReconnect = autoReconnect
+
+	if autoReconnect {
+		fmt.Println("Auto-reconnect enabled - tunnel will automatically restart on failure")
+	}
 
 	// Set up context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
