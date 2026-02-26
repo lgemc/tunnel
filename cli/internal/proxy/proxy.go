@@ -697,7 +697,7 @@ func (p *Proxy) downloadFromS3(ctx context.Context, presignedURL string) ([]byte
 	if err != nil {
 		return nil, fmt.Errorf("failed to create S3 GET request: %w", err)
 	}
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("S3 GET failed: %w", err)
