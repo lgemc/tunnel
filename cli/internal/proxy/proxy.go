@@ -375,7 +375,7 @@ func (p *Proxy) handleHTTPRequest(ctx context.Context, message WebSocketMessage)
 	}
 
 	// Make request to local service
-	client := &http.Client{Timeout: 180 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to make local request: %v", err)
@@ -533,7 +533,7 @@ func (p *Proxy) handleProxyRequest(ctx context.Context, message WebSocketMessage
 	}
 
 	// Make request to local service
-	client := &http.Client{Timeout: 180 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to make local request: %v", err)
