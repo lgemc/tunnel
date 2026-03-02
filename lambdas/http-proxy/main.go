@@ -32,6 +32,7 @@ var (
 	websocketEndpoint    string
 	domainName           string
 	uploadsBucket        string
+	reconnectGracePeriod time.Duration
 	dbClient             *db.DynamoDBClient
 	s3Client             *s3.Client
 	s3PresignClient      *s3.PresignClient
@@ -47,6 +48,20 @@ func init() {
 
 	if domainsTable == "" || tunnelsTable == "" || pendingRequestsTable == "" || websocketEndpoint == "" || domainName == "" {
 		panic("Required environment variables are missing")
+	}
+
+	// Parse reconnect grace period (default: 30s)
+	gracePeriodStr := os.Getenv("TUNNEL_RECONNECT_GRACE_PERIOD")
+	if gracePeriodStr == "" {
+		reconnectGracePeriod = 30 * time.Second
+	} else {
+		parsed, err := time.ParseDuration(gracePeriodStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid TUNNEL_RECONNECT_GRACE_PERIOD: %v, using default 30s\n", err)
+			reconnectGracePeriod = 30 * time.Second
+		} else {
+			reconnectGracePeriod = parsed
+		}
 	}
 }
 
@@ -79,6 +94,47 @@ func generateRequestID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// waitForTunnelReconnect waits for an inactive tunnel to become active again.
+// Returns the updated tunnel if it becomes active, or an error if the grace period expires.
+// Only waits if the tunnel was recently active (updated within last 5 minutes).
+func waitForTunnelReconnect(ctx context.Context, tunnelID string, tunnel *models.Tunnel) (*models.Tunnel, error) {
+	// Only apply grace period if tunnel was recently active (within 5 minutes)
+	if time.Since(tunnel.UpdatedAt) > 5*time.Minute {
+		return nil, fmt.Errorf("tunnel has been inactive for too long")
+	}
+
+	fmt.Printf("Tunnel %s is inactive but was recently connected, waiting up to %v for reconnect...\n", tunnelID, reconnectGracePeriod)
+
+	deadline := time.Now().Add(reconnectGracePeriod)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	tunnelKey := map[string]types.AttributeValue{
+		"tunnel_id": &types.AttributeValueMemberS{Value: tunnelID},
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("request cancelled while waiting for tunnel reconnect")
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("tunnel did not reconnect within grace period")
+			}
+
+			var updatedTunnel models.Tunnel
+			if err := dbClient.GetItem(ctx, tunnelsTable, tunnelKey, &updatedTunnel); err != nil {
+				continue
+			}
+
+			if updatedTunnel.Status == models.TunnelStatusActive && updatedTunnel.ConnectionID != "" {
+				fmt.Printf("Tunnel %s reconnected successfully!\n", tunnelID)
+				return &updatedTunnel, nil
+			}
+		}
+	}
 }
 
 func initClients(ctx context.Context) error {
@@ -194,11 +250,19 @@ func handleProxy(ctx context.Context, request events.APIGatewayV2HTTPRequest) (*
 	if err := dbClient.GetItem(ctx, tunnelsTable, tunnelKey, &tunnel); err != nil {
 		return errorResponse(404, "Tunnel not found")
 	}
-	if tunnel.Status != models.TunnelStatusActive {
-		return errorResponse(503, "Tunnel is not active")
-	}
-	if tunnel.ConnectionID == "" {
-		return errorResponse(503, "Tunnel is not connected")
+
+	// If tunnel is inactive, wait for reconnection (grace period)
+	if tunnel.Status != models.TunnelStatusActive || tunnel.ConnectionID == "" {
+		reconnectedTunnel, waitErr := waitForTunnelReconnect(ctx, domain.TunnelID, &tunnel)
+		if waitErr != nil {
+			// Grace period expired without reconnection
+			if tunnel.Status != models.TunnelStatusActive {
+				return errorResponse(503, "Tunnel is not active")
+			}
+			return errorResponse(503, "Tunnel is not connected")
+		}
+		// Use the reconnected tunnel
+		tunnel = *reconnectedTunnel
 	}
 
 	requestID, err := generateRequestID()
@@ -514,6 +578,8 @@ func pollAndReturn(ctx context.Context, requestID string) (*events.LambdaFunctio
 
 	for {
 		select {
+		case <-ctx.Done():
+			return errorResponse(499, "Client disconnected")
 		case <-pollTimeout:
 			return errorResponse(504, "Gateway timeout - no response from tunnel")
 		case <-ticker.C:
@@ -628,6 +694,8 @@ func buildStreamingResponse(ctx context.Context, requestID string, firstItem map
 
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-streamTimeout:
 				return
 			case <-ticker.C:

@@ -231,13 +231,14 @@ resource "aws_lambda_function" "http_proxy" {
 
   environment {
     variables = {
-      DOMAINS_TABLE          = aws_dynamodb_table.domains.name
-      TUNNELS_TABLE          = aws_dynamodb_table.tunnels.name
-      PENDING_REQUESTS_TABLE = aws_dynamodb_table.pending_requests.name
-      WEBSOCKET_ENDPOINT     = "${replace(aws_apigatewayv2_api.websocket_api.api_endpoint, "wss://", "https://")}/${aws_apigatewayv2_stage.websocket_api.name}"
-      DOMAIN_NAME            = var.domain_name
-      UPLOADS_BUCKET         = aws_s3_bucket.uploads.bucket
-      ENVIRONMENT            = var.environment
+      DOMAINS_TABLE                   = aws_dynamodb_table.domains.name
+      TUNNELS_TABLE                   = aws_dynamodb_table.tunnels.name
+      PENDING_REQUESTS_TABLE          = aws_dynamodb_table.pending_requests.name
+      WEBSOCKET_ENDPOINT              = "${replace(aws_apigatewayv2_api.websocket_api.api_endpoint, "wss://", "https://")}/${aws_apigatewayv2_stage.websocket_api.name}"
+      DOMAIN_NAME                     = var.domain_name
+      UPLOADS_BUCKET                  = aws_s3_bucket.uploads.bucket
+      TUNNEL_RECONNECT_GRACE_PERIOD   = "30s"
+      ENVIRONMENT                     = var.environment
     }
   }
 }
